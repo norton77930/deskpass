@@ -1,0 +1,39 @@
+name: CI
+
+# Checks that need no interactive desktop: the TypeScript build, the npm tests other than the
+# end-to-end ones (they open real windows), the Rust unit tests, and that every Rust integration
+# test compiles. The desktop tests (helper/tests) run on a real desktop, not here.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build:ts
+
+      - name: Build the helper and its test binaries
+        run: cargo test --manifest-path helper/Cargo.toml --no-run
+
+      - name: Rust unit tests
+        run: cargo test --manifest-path helper/Cargo.toml --bins
+
+      - name: npm tests
+        env:
+          DESKPASS_NO_DESKTOP: "1"
+        run: npm test

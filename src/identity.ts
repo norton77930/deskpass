@@ -1,0 +1,90 @@
+import { stat } from "node:fs/promises";
+import path from "node:path";
+import { appKey } from "./policy.ts";
+
+/**
+ * Ticket 93: who an app is, as the helper's `app_identity` reports it (spec-phase4b, app identity and
+ * always allow). `signer` is the leaf certificate's full subject of a verified Authenticode signature;
+ * a packaged app has `package_family_name` instead (its package is Windows' to verify).
+ */
+export interface AppIdentity {
+  signed: boolean;
+  signer: string | null;
+  /** Lower case. */
+  file_name: string;
+  package_family_name?: string;
+}
+
+/** A well-formed `app_identity` result, or null (then the app is treated as unsigned). */
+export function readAppIdentity(result: unknown): AppIdentity | null {
+  if (typeof result !== "object" || result === null) return null;
+  const { signed, signer, file_name: fileName, package_family_name: family } = result as Record<string, unknown>;
+  if (typeof signed !== "boolean" || typeof fileName !== "string" || fileName.length === 0) return null;
+  if (signed && (typeof signer !== "string" || signer.length === 0)) return null;
+  if (family !== undefined && (typeof family !== "string" || family.length === 0)) return null;
+  return { signed, signer: signed ? (signer as string) : null, file_name: fileName.toLowerCase(), ...(family === undefined ? {} : { package_family_name: family }) };
+}
+
+/**
+ * Ticket 93: the key an app is known by in the log, and (tickets 94, 95) in its grants and this
+ * session's approvals:
+ * - a packaged app: `package:` and its package family name, lower case;
+ * - a signed app: `signer:`, the signer's subject as the helper reports it, `|` and the file name in
+ *   lower case (a file name cannot hold `|`, so the last `|` splits the two);
+ * - anything else, including an app whose identity could not be had: its normalized path
+ *   (`appKey`), as the log had it before this ticket. A path begins with a drive or `\\`, so it
+ *   never reads as one of the other two.
+ */
+export function identityKey(appPath: string, identity: AppIdentity | null): string {
+  if (identity?.package_family_name) return `package:${identity.package_family_name.toLowerCase()}`;
+  if (identity?.signed && identity.signer) return `signer:${identity.signer}|${identity.file_name}`;
+  return appKey(appPath);
+}
+
+/**
+ * Ticket 93: the identities this server has had from the helper, by normalized path, modification
+ * time and size, so each approval check has one without verifying the signature again until the
+ * executable changes. Only a well-formed answer for a file whose modification time and size were
+ * read (before and after asking, unchanged) is kept; a failure is asked again next time.
+ *
+ * Ticket 95: the identity kept for a path does not depend on which check asked first. A window's
+ * check sends the process (`pid`), from which the helper can read a package identity the path
+ * alone may not show (a packaged app outside `WindowsApps`); a launch has no process yet. An answer
+ * got with a process replaces one got without, and a check without a process uses whichever is
+ * kept, so once a window of the executable was checked, its launches are keyed (and granted) as
+ * its windows are. Only a launch before any window check of a packaged app outside `WindowsApps`
+ * can still get the other key, and then its grant is not found and the user is asked.
+ */
+export class IdentityCache {
+  private readonly entries = new Map<string, { version: string; identity: AppIdentity; withPid: boolean }>();
+
+  /** The identity of `appPath` (run by `pid`, when a window's), or null when it cannot be had. */
+  async of(appPath: string, pid: number | undefined, ask: (params: Record<string, unknown>) => Promise<unknown>): Promise<AppIdentity | null> {
+    // The helper takes Windows paths only, so a path written with `/` is sent with `\`.
+    const windowsPath = appPath.replaceAll("/", "\\");
+    if (!path.win32.isAbsolute(windowsPath) || !/^([a-z]:\\|\\\\)/i.test(windowsPath)) return null;
+    const key = appKey(windowsPath);
+    const before = await fileVersion(windowsPath);
+    const cached = this.entries.get(key);
+    if (cached && before !== null && cached.version === before && (cached.withPid || pid === undefined)) return cached.identity;
+    let identity: AppIdentity | null;
+    try {
+      identity = readAppIdentity(await ask(pid === undefined ? { path: windowsPath } : { path: windowsPath, pid }));
+    } catch {
+      // A failed or timed-out check is no identity: the app is treated as unsigned.
+      return null;
+    }
+    if (identity && before !== null && (await fileVersion(windowsPath)) === before) this.entries.set(key, { version: before, identity, withPid: pid !== undefined });
+    return identity;
+  }
+}
+
+/** The file's modification time and size, as one comparable string; null when it cannot be read. */
+async function fileVersion(appPath: string): Promise<string | null> {
+  try {
+    const { mtimeMs, size } = await stat(appPath);
+    return `${mtimeMs}:${size}`;
+  } catch {
+    return null;
+  }
+}

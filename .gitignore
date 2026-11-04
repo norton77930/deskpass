@@ -1,0 +1,15 @@
+# Installers and binaries under analysis
+*.exe
+
+# Internal notes and Claude Code project settings (kept out of the public repository)
+.scratch/
+.claude/
+
+node_modules/
+dist/
+target/
+test-tmp/
+*.log
+
+# Install packages (npm run package)
+release/

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "generation": 3,
+  "grants": [],
+  "raised": [
+    {
+      "key": "signer:C=US, S=Washington, L=Redmond, O=Contoso Ltd, CN=Contoso Ltd|notes.exe",
+      "tier": "blocked",
+      "created_at": "2026-02-01T00:00:00.000Z",
+      "mac": "66d2d1e8f91be8385999160a55f62f97831c5e9dd4a1c78db080dc38561d3fa1"
+    }
+  ],
+  "file_mac": "9abec24d7298a0cbb86c06e866d59520913497f9d1e442c33cad89acd95ea0a6"
+}
