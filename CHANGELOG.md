@@ -40,6 +40,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   advisories, among them zod's memory exhaustion on oversized collections
   (GHSA-mrhx-c7xc-m3w5); it now reports none. Deskpass uses zod only
   through the SDK.
+- A background action whose UI Automation call did not answer within 3
+  seconds keeps its foreground watch until that call returns (at most 30
+  seconds). The call cannot be cancelled, so the app could take the action,
+  and the foreground, after the request had been answered, when nothing gave
+  the foreground back any more.
+- The server waits 15 seconds for `click`, `element_action` and `set_value`
+  instead of 10. A background click at a point can take about 11.5 seconds at
+  worst, and timing out killed the helper in the middle of the action, with the
+  watch that gives the foreground back.
 
 ## [0.1.0] - 2026-11-04
 

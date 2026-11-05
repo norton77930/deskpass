@@ -1,11 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { ASK_USER_TIMEOUT_MS, CONFIRM_CHANGE_MARGIN_MS, DEFAULT_REQUEST_TIMEOUT_MS, LAUNCH_APP_TIMEOUT_MS, PASTE_TEXT_TIMEOUT_MS, PROTOCOL_VERSION, TYPE_TEXT_TIMEOUT_MS } from "./config.ts";
+import { ASK_USER_TIMEOUT_MS, BACKGROUND_ACTION_TIMEOUT_MS, CONFIRM_CHANGE_MARGIN_MS, DEFAULT_REQUEST_TIMEOUT_MS, LAUNCH_APP_TIMEOUT_MS, PASTE_TEXT_TIMEOUT_MS, PROTOCOL_VERSION, TYPE_TEXT_TIMEOUT_MS } from "./config.ts";
 import { ToolFailure } from "./errors.ts";
 import { buildMismatchMessage, readExpectedBuild } from "./helper-build.ts";
 import type { UiLanguage } from "./ui-language.ts";
 
 /** Methods that wait on the user: sent alone, and nothing else is sent until they are answered. */
 const USER_METHODS = new Set(["ask_user", "confirm_change"]);
+
+/** The actions that can be delivered in the background, which take longer at worst (`BACKGROUND_ACTION_TIMEOUT_MS`). */
+const BACKGROUND_ACTION_METHODS = new Set(["click", "element_action", "set_value"]);
 
 /** Ticket 114: the longest `timeout_ms` the helper takes for `confirm_change`; a request asking for more is refused by it. */
 const CONFIRM_CHANGE_MAX_MS = 120_000;
@@ -177,6 +180,7 @@ export class HelperClient {
     if (method === "paste_text") return PASTE_TEXT_TIMEOUT_MS;
     if (method === "ask_user") return ASK_USER_TIMEOUT_MS;
     if (method === "list_start_menu_apps") return LIST_START_MENU_APPS_TIMEOUT_MS;
+    if (BACKGROUND_ACTION_METHODS.has(method)) return BACKGROUND_ACTION_TIMEOUT_MS;
     return DEFAULT_REQUEST_TIMEOUT_MS;
   }
 

@@ -16,6 +16,16 @@ export const SERVER_VERSION = "0.1.0";
 export const PROTOCOL_VERSION = "10";
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * The wait for the actions that can be delivered in the background (`click`, `element_action`,
+ * `set_value`). Before it acts the helper checks that the target answers (up to 1 s) and waits for
+ * the user to be idle (up to 3 s, `WAIT_CAP` in helper/src/idle.rs); a click at a point then has
+ * up to 6 s to find the element and act on it (`ACTION_BUDGET` and `TREE_BUDGET` in
+ * helper/src/uia.rs), and the foreground watch ends up to 1.5 s after the action (`WATCH_AFTER_ACTION`
+ * and `RESTACK_GRACE` in helper/src/restore.rs): about 11.5 s at worst. Timing out kills the helper,
+ * and with it the watch that gives the foreground back, so this stays clear of that.
+ */
+export const BACKGROUND_ACTION_TIMEOUT_MS = 15_000;
 export const LAUNCH_APP_TIMEOUT_MS = 15_000;
 /**
  * The helper stops starting characters 20 seconds into a type_text request and answers

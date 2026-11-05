@@ -118,6 +118,22 @@ test("type_text waits 30 seconds, past the helper's 20-second typing limit, whil
   }
 });
 
+test("a click, element action or value set waits 15 seconds: a background one can take about 11.5 at worst", { timeout: 80_000 }, async () => {
+  for (const method of ["click", "element_action", "set_value"]) {
+    const withinBudget = await launchScriptedHelper({ handlers: { [method]: [{ delayMs: 12_000, result: { done: true } }] } });
+    const overBudget = await launchScriptedHelper({ handlers: { [method]: [{ delayMs: 16_000, result: { done: true } }] } });
+    try {
+      const [succeeded, timedOut] = await Promise.allSettled([withinBudget.helper.request(method, { window_id: "5" }), overBudget.helper.request(method, { window_id: "5" })]);
+      assert.equal(succeeded.status, "fulfilled", `${method}: ${succeeded.status === "rejected" ? String(succeeded.reason) : ""}`);
+      assert.equal(timedOut.status, "rejected", method);
+      assert.ok(timedOut.status === "rejected" && timedOut.reason instanceof ToolFailure && timedOut.reason.code === "helper_timeout", method);
+    } finally {
+      await withinBudget.close();
+      await overBudget.close();
+    }
+  }
+});
+
 test("launch_app waits 15 seconds while other requests time out at 10", { timeout: 40_000 }, async () => {
   const withinBudget = await launchScriptedHelper({
     handlers: { launch_app: [{ delayMs: 14_000, result: { started: true } }] },

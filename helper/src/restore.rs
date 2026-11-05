@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,17 @@ impl Watched {
 
 /// Whether the watch is over at `now`: only once the action returned (`returned`) and
 /// `WATCH_AFTER_ACTION` has passed since.
+/// How long a watch goes on after its request was answered, for an action whose UI Automation call
+/// was still running when the request timed out (`ForegroundWatch::finish_when`): the call cannot be
+/// cancelled, so the app may still take the action, and the foreground, once it answers.
+pub(crate) const LATE_ACTION_WATCH: Duration = Duration::from_secs(30);
+
+/// Whether a late watch (`finish_when`) can stop waiting for its action at `now`: the action's call
+/// returned, or `LATE_ACTION_WATCH` has passed since `since`.
+pub(crate) fn late_wait_over(returned: bool, since: Instant, now: Instant) -> bool {
+    returned || now >= since + LATE_ACTION_WATCH
+}
+
 pub(crate) fn watch_over(returned: Option<Instant>, now: Instant) -> bool {
     returned.is_some_and(|returned| now >= returned + WATCH_AFTER_ACTION)
 }
@@ -240,6 +252,23 @@ impl ForegroundWatch {
             let _ = PostThreadMessageW(self.thread, WM_ACTION_RETURNED, WPARAM(0), LPARAM(0));
         }
         self.handle.join().unwrap_or(Report::Unchanged)
+    }
+
+    /// The request timed out while the action's call was still running, and was answered: the
+    /// watch goes on, on a thread of its own, until `returned` is set (the call came back) or for
+    /// `LATE_ACTION_WATCH`, and then ends as `finish` ends it, so a target that takes the foreground
+    /// when it finally acts is still given back (ADR 0002). What it would report goes nowhere. It
+    /// still ends early when another app takes the foreground, as every watch does.
+    pub(crate) fn finish_when(self, returned: Arc<AtomicBool>) {
+        let since = Instant::now();
+        std::thread::spawn(move || {
+            while !late_wait_over(returned.load(Ordering::SeqCst), since, Instant::now()) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if matches!(self.finish(), Report::RestoreFailed) {
+                eprintln!("foreground restore: a late action's target kept the foreground");
+            }
+        });
     }
 }
 
@@ -473,6 +502,15 @@ unsafe fn anchor_above(target: HWND) -> Option<HWND> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_late_watch_waits_for_its_action_at_most_late_action_watch() {
+        let since = Instant::now();
+        assert!(!super::late_wait_over(false, since, since));
+        assert!(!super::late_wait_over(false, since, since + super::LATE_ACTION_WATCH - Duration::from_millis(1)));
+        assert!(super::late_wait_over(false, since, since + super::LATE_ACTION_WATCH));
+        assert!(super::late_wait_over(true, since, since), "a call that returned ends the wait at once");
+    }
+
     use super::*;
 
     const USER: isize = 0x100;

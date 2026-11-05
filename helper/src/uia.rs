@@ -579,7 +579,11 @@ where
         Delivery::Background => unsafe { ForegroundWatch::start(hwnd, before) },
         Delivery::Foreground => None,
     };
+    // Set when the job ends, however it ends (a panic too): a watch kept past a timeout waits for it.
+    let returned = Arc::new(AtomicBool::new(false));
+    let job_returned = SetOnDrop(returned.clone());
     let done = run_on_worker(deadline, move |automation| {
+        let _returned = job_returned;
         let element = find(automation, &at)?;
         // Ticket 92: nothing is done to a password field unless the action may be (ticket 101).
         if !password_ok && unsafe { is_password(&element) } {
@@ -588,10 +592,23 @@ where
         job(automation, &element, &reached)
     });
     // Ticket 138: the foreground stays watched (and restored) until after the action returned,
-    // whatever it answered.
-    let restore = watch.map_or(Report::Unchanged, ForegroundWatch::finish);
+    // whatever it answered. An action whose call was still running at the timeout may still be
+    // taken when the app answers: its watch goes on until the call returns (`finish_when`).
+    let late = keeps_watching(matches!(done, Err(WorkerError::TimedOut)), step.now());
+    let restore = match watch {
+        Some(watch) if late => {
+            watch.finish_when(returned);
+            Report::Unchanged
+        }
+        Some(watch) => watch.finish(),
+        None => Report::Unchanged,
+    };
     let done = match done {
         Ok(done) => done?,
+        Err(_) if late => {
+            step.abandon();
+            return Err(late_action_timeout());
+        }
         Err(error) => {
             step.abandon();
             return Err(worker_failure(error, step.now()));
@@ -611,6 +628,35 @@ where
         }
     }
     Ok(result)
+}
+
+/// Whether a background action's foreground watch goes on past its request: only when the request
+/// timed out while the action's own call was running (`Waiting::Act`). Before it, the job will not
+/// act (`Step::begin_action`); after it, the action returned while it was watched.
+fn keeps_watching(timed_out: bool, waiting: Waiting) -> bool {
+    timed_out && waiting == Waiting::Act
+}
+
+/// The timeout of a background action whose call was still running (`keeps_watching`).
+fn late_action_timeout() -> Failure {
+    let seconds = ACTION_BUDGET.as_secs();
+    let watch = crate::restore::LATE_ACTION_WATCH.as_secs();
+    (
+        "input_failed".to_string(),
+        format!(
+            "The app did not respond to the UI Automation request within {seconds} seconds; it may still perform the action later. Until it does (for up to {watch} seconds), Deskpass keeps giving the foreground back if the app takes it. Take a screenshot before retrying."
+        ),
+    )
+        .into()
+}
+
+/// Sets its flag when dropped.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// An element action's job on the worker: what it has reached, for the caller's timeout message,
@@ -3322,5 +3368,35 @@ mod tests {
         use windows::Win32::UI::Accessibility::{UIA_LegacyIAccessibleValuePropertyId, UIA_ValueValuePropertyId};
         assert!(!super::TREE_PROPERTIES.contains(&UIA_ValueValuePropertyId));
         assert!(!super::TREE_PROPERTIES.contains(&UIA_LegacyIAccessibleValuePropertyId));
+    }
+}
+
+#[cfg(test)]
+mod late_watch_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_action_whose_own_call_timed_out_keeps_its_watch() {
+        assert!(keeps_watching(true, Waiting::Act));
+        for waiting in [Waiting::Aim, Waiting::Prepare, Waiting::ReadBack] {
+            assert!(!keeps_watching(true, waiting), "{waiting:?}");
+        }
+        for waiting in [Waiting::Aim, Waiting::Prepare, Waiting::Act, Waiting::ReadBack] {
+            assert!(!keeps_watching(false, waiting), "an answered action ends its watch as usual: {waiting:?}");
+        }
+    }
+
+    #[test]
+    fn the_job_says_it_returned_however_it_ends() {
+        let returned = Arc::new(AtomicBool::new(false));
+        drop(SetOnDrop(returned.clone()));
+        assert!(returned.load(Ordering::SeqCst));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let flag = SetOnDrop(panicked.clone());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _flag = flag;
+            panic!("a job that panics");
+        }));
+        assert!(panicked.load(Ordering::SeqCst));
     }
 }
