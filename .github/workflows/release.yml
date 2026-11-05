@@ -1,0 +1,126 @@
+name: Release
+
+# Builds the release zip from the tagged source, on GitHub's runner rather than a workstation:
+# pushing a tag vX.Y.Z (the version in package.json and helper/Cargo.toml) builds the helper and the
+# bundle, runs the same checks as CI, packages release/deskpass-X.Y.Z.zip, records its SHA-256 and a
+# signed build provenance attestation (who built it, from which commit, by which workflow), and
+# opens a DRAFT release with the zip and its .sha256. The maintainer adds the notes (CHANGELOG.md)
+# and publishes it; nothing is published by itself.
+#
+# Users can check a downloaded zip against the attestation:
+#   gh attestation verify deskpass-X.Y.Z.zip --repo norton77930/deskpass
+#
+# Actions are pinned by commit SHA (the tag in the comment). No cache is restored in this workflow,
+# so nothing a pull request's run wrote can end up in a release.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # A dry run from the Actions tab: builds, tests and packages any branch, and keeps the zip with
+  # the run, but records no attestation and drafts no release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # the draft release
+      id-token: write # the provenance attestation's signing certificate
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Check the tag is the version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $cargo = (Select-String -Path helper/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and "v$version" -cne $env:GITHUB_REF_NAME) { throw "The tag $env:GITHUB_REF_NAME is not the version in package.json (v$version)." }
+          if ($cargo -cne $version) { throw "helper/Cargo.toml says $cargo, package.json says $version." }
+          $server = (Select-String -Path src/config.ts -Pattern 'SERVER_VERSION = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($server -cne $version) { throw "src/config.ts says SERVER_VERSION $server, package.json says $version." }
+          Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$version"
+
+      - name: Install
+        run: npm ci
+
+      # Each native command is a step of its own: pwsh does not stop at a command that fails.
+      - name: Build the helper
+        run: cargo build --locked --release --manifest-path helper/Cargo.toml
+
+      - name: Build the server and copy the helper into dist
+        run: npm run build
+
+      - name: Rust unit tests
+        run: cargo test --locked --manifest-path helper/Cargo.toml --bins
+
+      - name: npm tests
+        env:
+          DESKPASS_NO_DESKTOP: "1"
+        run: npm test
+
+      - name: Package
+        run: npm run package
+
+      - name: SHA-256
+        shell: pwsh
+        run: |
+          $name = "deskpass-$env:VERSION.zip"
+          $zip = "release/$name"
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          # The format Get-FileHash users compare by eye, and sha256sum -c reads.
+          [IO.File]::WriteAllText("$zip.sha256", "$hash  $name`n")
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP=$zip"
+          Add-Content -Path $env:GITHUB_ENV -Value "SHA256=$hash"
+          "SHA-256 of ${name}: $hash" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Build provenance
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ env.ZIP }}
+
+      - name: Keep the zip with the run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deskpass-${{ env.VERSION }}
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          if-no-files-found: error
+
+      - name: Draft the release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @(
+            "Built by the Release workflow from $env:GITHUB_SHA.",
+            "",
+            "SHA-256 of deskpass-$env:VERSION.zip:",
+            "",
+            '```',
+            $env:SHA256,
+            '```',
+            "",
+            "Check it with ``Get-FileHash .\deskpass-$env:VERSION.zip -Algorithm SHA256``, or check the build provenance with ``gh attestation verify deskpass-$env:VERSION.zip --repo $env:GITHUB_REPOSITORY``.",
+            "",
+            "<!-- Add the CHANGELOG.md section for $env:VERSION above this line, then publish. -->"
+          ) -join "`n"
+          [IO.File]::WriteAllText("release/notes.md", $notes)
+          gh release create $env:GITHUB_REF_NAME $env:ZIP "$env:ZIP.sha256" --draft --verify-tag --title "Deskpass $env:VERSION" --notes-file release/notes.md

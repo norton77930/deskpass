@@ -50,6 +50,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   worst, and timing out killed the helper in the middle of the action, with the
   watch that gives the foreground back.
 
+### Changed
+
+- Releases are built by a GitHub Actions workflow from the tagged source, not
+  on a workstation: it runs the checks, packages the zip, publishes its SHA-256
+  and a signed build provenance (`gh attestation verify`), and opens a draft
+  release. CI's actions are pinned by commit SHA with read-only permissions,
+  the Rust toolchain is pinned (`rust-toolchain.toml`), and Dependabot proposes
+  updates.
+
 ## [0.1.0] - 2026-11-04
 
 First public version of Deskpass, a Windows computer use MCP server for Claude

@@ -54,6 +54,11 @@
    Get-FileHash .\deskpass-0.1.0.zip -Algorithm SHA256
    ```
 
+   Release 由 [Release workflow](.github/workflows/release.yml) 從打了 tag 的原始碼
+   建置,並附有簽署過的建置來源證明(build provenance)。裝了
+   [GitHub CLI](https://cli.github.com/) 的話,可以確認 zip 就是它建置的那一份:
+   `gh attestation verify deskpass-0.1.0.zip --repo norton77930/deskpass`。
+
 3. 解壓縮 zip,在解壓縮出來的資料夾開 PowerShell,執行:
 
    ```powershell

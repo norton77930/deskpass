@@ -343,7 +343,7 @@ Deskpass 附帶一支 Rust 寫的 helper(`dist\deskpass-helper.exe`),真正的�
 Get-FileHash .\deskpass-0.1.0.zip -Algorithm SHA256
 ```
 
-輸出的 `Hash` 欄位要和 Release 說明裡的 SHA-256 完全相同(十六進位字母大小寫不影響)。不相同就不要安裝,請重新下載,還是不同就回報(見 [SECURITY](../SECURITY.md))。雜湊值只證明檔案和發布者放上去的一樣;要連發布者都不用信任,可以自己照 [開發文件](development.md) 的「Build」和「Packaging」從原始碼建置、打包。
+輸出的 `Hash` 欄位要和 Release 說明裡的 SHA-256 完全相同(十六進位字母大小寫不影響)。不相同就不要安裝,請重新下載,還是不同就回報(見 [SECURITY](../SECURITY.md))。雜湊值只證明檔案和發布者放上去的一樣。zip 是 GitHub 的 Release workflow 從打了 tag 的原始碼建置的,並附有簽署過的建置來源證明;裝了 [GitHub CLI](https://cli.github.com/) 可以執行 `gh attestation verify deskpass-0.1.0.zip --repo norton77930/deskpass`,確認 zip 是哪一個 commit、由哪個 workflow 建置的。要連 GitHub 的建置都不用信任,可以自己照 [開發文件](development.md) 的「Build」和「Packaging」從原始碼建置、打包。
 
 ## SmartScreen 或公司資安擋下時怎麼辦
 

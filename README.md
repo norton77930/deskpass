@@ -58,6 +58,11 @@ tools.
    Get-FileHash .\deskpass-0.1.0.zip -Algorithm SHA256
    ```
 
+   Releases are built by the [Release workflow](.github/workflows/release.yml)
+   from the tagged source, with a signed build provenance. With the
+   [GitHub CLI](https://cli.github.com/) you can check that the zip is the one it
+   built: `gh attestation verify deskpass-0.1.0.zip --repo norton77930/deskpass`.
+
 3. Extract the zip, open PowerShell in the extracted folder and run:
 
    ```powershell
