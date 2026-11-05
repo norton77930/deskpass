@@ -35,6 +35,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   whoever built it, is also flattened to one line of at most 100 characters,
   without bidi or zero-width characters, wherever Deskpass shows it, including
   the approval question.
+- The MCP SDK is 1.32.2 and zod 4.6.7 (from 1.30 and 3.25), and the locked
+  dependencies are updated: `npm audit` reported 3 high and 5 moderate
+  advisories, among them zod's memory exhaustion on oversized collections
+  (GHSA-mrhx-c7xc-m3w5); it now reports none. Deskpass uses zod only
+  through the SDK.
 
 ## [0.1.0] - 2026-11-04
 
