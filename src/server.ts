@@ -2354,8 +2354,17 @@ async function launchTarget(helper: HelperPort, session: LiveSession, resolveApp
   return checkedLaunch(helper, session, resolved);
 }
 
+/**
+ * What a launch refuses to start when its file is not an `.exe`. The tiers are decided by an
+ * executable's name, and Windows starts a `.bat` or `.cmd` through cmd.exe and a `.lnk`, `.ps1`
+ * or `.vbs` through another program, so such a file would run a program its own name does not show.
+ */
+const NOT_AN_EXECUTABLE =
+  "computer_launch_app starts .exe files only: a script or shortcut would run another program (a .bat or .cmd runs cmd.exe), which the approval would not name. Pass the path of the program's .exe instead.";
+
 /** The checks every launch's executable passes, however it was found. */
 async function checkedLaunch(helper: HelperPort, session: LiveSession, resolved: string): Promise<Refusal | LaunchTarget> {
+  if (!/\.exe$/i.test(resolved)) return refuse("invalid_params", NOT_AN_EXECUTABLE);
   const appName = resolved.split(/[/\\]/).pop()?.replace(/\.exe$/i, "") || resolved;
   return (await launchRefusal(helper, session, resolved, appName)) ?? { resolved, appName };
 }

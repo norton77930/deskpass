@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- `reg.exe` and `rundll32.exe` are started by their full `System32` path. Started
+  by their bare names, Windows looked for them in the current directory first,
+  which is the folder the MCP client started the server in (usually the user's
+  project), so a program of that name in a cloned repository ran when the server
+  started.
+- `computer_launch_app` starts `.exe` files only. A `.bat` or `.cmd` ran through
+  cmd.exe, a blocked-tier terminal, while the approval named only the script.
+- `computer_launch_app` no longer looks a relative path up in the current
+  directory: `app` is a full path or a name the App Paths registry knows.
+
 ## [0.1.0] - 2026-11-04
 
 First public version of Deskpass, a Windows computer use MCP server for Claude

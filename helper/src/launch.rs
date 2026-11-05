@@ -24,6 +24,11 @@ pub fn launch_app(params: &Value) -> Result<Value, (String, String)> {
     if app.is_empty() || !std::path::Path::new(app).exists() {
         return Err(("launch_failed".to_string(), "Could not find that executable.".to_string()));
     }
+    // The server refuses these first; this is the helper's own guard. `Command` starts a `.bat`
+    // or `.cmd` through cmd.exe, so only a program's own `.exe` is started.
+    if !is_exe(app) {
+        return Err(("invalid_params".to_string(), "launch_app starts .exe files only.".to_string()));
+    }
     let aumid = params.get("aumid").and_then(|value| value.as_str()).filter(|aumid| !aumid.is_empty());
     // Windows that exist now never count as the launch's result.
     let existing = existing_windows();
@@ -92,6 +97,11 @@ impl Started {
             Started::Activated(pid) => *pid,
         }
     }
+}
+
+/// Whether `app` names an `.exe` file (compared without regard to case).
+fn is_exe(app: &str) -> bool {
+    std::path::Path::new(app).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
 }
 
 fn spawn_app(app: &str) -> Result<std::process::Child, (String, String)> {
@@ -190,5 +200,19 @@ fn app_pid(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
     match windows_list::identify(hwnd, pid)? {
         windows_list::Identity::Hosted { pid: app, .. } => Some(app),
         _ => Some(pid),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_exe;
+
+    #[test]
+    fn only_an_exe_is_started() {
+        assert!(is_exe(r"C:\Windows\notepad.exe"));
+        assert!(is_exe(r"C:\Apps\Demo.EXE"));
+        for other in [r"C:\Users\me\run.bat", r"C:\Users\me\run.cmd", r"C:\Users\me\App.lnk", r"C:\Users\me\x.ps1", r"C:\Users\me\x.exe.bat", r"C:\Users\me\noext"] {
+            assert!(!is_exe(other), "{other}");
+        }
     }
 }
