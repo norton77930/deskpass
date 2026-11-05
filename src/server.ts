@@ -18,7 +18,7 @@ import { imageToWindow, targetSize, windowSpanToImage } from "./scaler.ts";
 import { ScreenshotStore, type ScreenshotView, type StoredScreenshot } from "./screenshots.ts";
 import { done, refuse, renderBatch, renderStep, sentInput, type BatchRun, type Refusal, type StepFailure, type StepResult, type StepSuccess } from "./steps.ts";
 import { BACKGROUND_OFF_NOTE, BACKGROUND_UNAVAILABLE, backgroundUnavailable, backgroundUnavailableData, deliveryModeSchema, readDeliveryMode, type BackgroundUnavailableReason, type DeliveryMode } from "./delivery.ts";
-import { cutValue, escapeAppText, formatTree, type TreeScale, type UiElement, type UiTree } from "./tree-format.ts";
+import { cutValue, escapeAppText, flatAppName, formatTree, type TreeScale, type UiElement, type UiTree } from "./tree-format.ts";
 import { TreeStore, type TreeView } from "./trees.ts";
 import { uiLanguage, type UiLanguage } from "./ui-language.ts";
 
@@ -2471,7 +2471,7 @@ function readListed(window: Record<string, unknown>): WindowInfo {
   return {
     window_id: String(window.window_id ?? ""),
     app: String(window.app ?? ""),
-    app_name: String(window.app_name ?? ""),
+    app_name: flatAppName(String(window.app_name ?? "")),
     title: String(window.title ?? ""),
     minimized: Boolean(window.minimized),
     elevated: Boolean(window.elevated),
@@ -3000,7 +3000,7 @@ function readWindowGeometry(result: unknown): WindowGeometry {
   return {
     window_id: String(window.window_id ?? ""),
     app: String(window.app ?? ""),
-    app_name: String(window.app_name ?? ""),
+    app_name: flatAppName(String(window.app_name ?? "")),
     title: String(window.title ?? ""),
     minimized: Boolean(window.minimized),
     elevated: Boolean(window.elevated),
@@ -3180,7 +3180,7 @@ function readWindows(result: unknown): WindowInfo[] {
     return {
       window_id: String(window.window_id ?? ""),
       app: String(window.app ?? ""),
-      app_name: String(window.app_name ?? ""),
+      app_name: flatAppName(String(window.app_name ?? "")),
       title: String(window.title ?? ""),
       minimized: Boolean(window.minimized),
       elevated: Boolean(window.elevated),
@@ -3197,8 +3197,8 @@ function formatWindows(windows: WindowInfo[]): string {
       [
         `window_id: ${window.window_id}`,
         `app: ${window.app}`,
-        `app_name: ${window.app_name}`,
-        `title: ${window.title}`,
+        `app_name: "${escapeAppText(window.app_name)}"`,
+        `title: "${escapeAppText(window.title)}"`,
         `minimized: ${window.minimized}`,
         `elevated: ${window.elevated}`,
         ...(window.owner_window_id ? [`owner_window_id: ${window.owner_window_id}`] : []),
@@ -3337,7 +3337,7 @@ function failureMessage(error: ToolFailure): string {
   if (typeof windowId !== "string" || windowId.length === 0) return error.message;
   const title = typeof error.data?.title === "string" ? error.data.title : "";
   return [
-    `The target window has an open dialog (window_id: ${windowId}, title: "${title}"), so no input was sent.`,
+    `The target window has an open dialog (window_id: ${escapeAppText(windowId)}, title: "${escapeAppText(title)}"), so no input was sent.`,
     `Use window_id ${windowId} as the target: take a screenshot of it, then operate or close the dialog before returning to the original window.`,
   ].join(" ");
 }
@@ -3355,10 +3355,10 @@ function coveredMessage(activated: unknown): string[] {
   if (!Array.isArray(covers) || covers.length === 0) return [];
   const text = (value: unknown) => (typeof value === "string" ? value : "");
   const name = (cover: Record<string, unknown>) => {
-    const appName = text(cover?.app_name) || "another app";
+    const appName = flatAppName(text(cover?.app_name)) || "another app";
     const app = text(cover?.app);
     const owner = app ? `${appName} (${app})` : appName;
-    return `a window of ${owner} (window_id: ${text(cover?.window_id)}, title: "${text(cover?.title)}")`;
+    return `a window of ${owner} (window_id: ${escapeAppText(text(cover?.window_id))}, title: "${escapeAppText(text(cover?.title))}")`;
   };
   const stays = covers.filter((cover: Record<string, unknown>) => cover?.topmost !== false).map(name);
   const refused = covers.filter((cover: Record<string, unknown>) => cover?.topmost === false).map(name);
@@ -3433,7 +3433,7 @@ function foregroundChangedMessage(result: unknown, target: WindowGeometry, input
   const { foreground, target_closed: closed } = changed as { foreground?: unknown; target_closed?: unknown };
   const text = (value: unknown) => (typeof value === "string" ? value : "");
   const window = (typeof foreground === "object" && foreground !== null ? foreground : {}) as Record<string, unknown>;
-  const windowId = text(window.window_id);
+  const windowId = escapeAppText(text(window.window_id));
   if (windowId === "") {
     return closed === true
       ? [`The target window closed after the ${input}, and no window that computer_list_windows lists is in the foreground.`, "Call computer_list_windows to see which windows are open before continuing."]
@@ -3442,10 +3442,10 @@ function foregroundChangedMessage(result: unknown, target: WindowGeometry, input
           "Call computer_list_windows to see which windows are open before continuing.",
         ];
   }
-  const appName = text(window.app_name) || "another app";
+  const appName = flatAppName(text(window.app_name)) || "another app";
   const app = text(window.app);
   const sameApp = app !== "" && app.toLowerCase() === target.app.toLowerCase();
-  const named = `(window_id: ${windowId}, title: "${text(window.title)}")`;
+  const named = `(window_id: ${windowId}, title: "${escapeAppText(text(window.title))}")`;
   const who = sameApp ? `another window of ${appName} ${named}` : `a window of ${app ? `${appName} (${app})` : appName} ${named}, a different app`;
   const lines = [closed === true ? `The target window closed after the ${input}; the foreground is now ${who}.` : `After the ${input}, the foreground moved to ${who}.`];
   if (!sameApp) lines.push(`The ${input} went to the target window of ${target.app_name}, not to ${appName}.`);
@@ -3457,10 +3457,10 @@ function obscuredMessage(error: ToolFailure): string {
   const windowId = error.data?.window_id;
   if (typeof windowId !== "string" || windowId.length === 0) return error.message;
   const text = (value: unknown) => (typeof value === "string" ? value : "");
-  const appName = text(error.data?.app_name) || "another app";
+  const appName = flatAppName(text(error.data?.app_name)) || "another app";
   const app = text(error.data?.app);
   const owner = app ? `${appName} (${app})` : appName;
-  const covered = `The target window is covered at that point by a window of ${owner} (window_id: ${windowId}, title: "${text(error.data?.title)}"), so no input was sent.`;
+  const covered = `The target window is covered at that point by a window of ${owner} (window_id: ${escapeAppText(windowId)}, title: "${escapeAppText(text(error.data?.title))}"), so no input was sent.`;
   // Not topmost: the cover is an ordinary window, so raising the target is the fix. A missing flag
   // (an older helper) keeps the advice for a window that stays on top.
   if (error.data?.topmost === false) {

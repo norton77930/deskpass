@@ -79,6 +79,28 @@ export function escapeAppText(text: string): string {
   return escaped;
 }
 
+/** The most characters (code points) of an app's name as Deskpass shows it. */
+export const APP_NAME_LIMIT = 100;
+
+/**
+ * An app's name (a window's `app_name`: its executable's file description, which whoever built the
+ * executable chose) as Deskpass shows it to the model and to the user in an approval question: a
+ * lone surrogate becomes U+FFFD, a format character (a bidi override, a zero-width one) is dropped,
+ * a control character or a line or paragraph separator becomes a space, white space runs become
+ * one space, and it is cut to `APP_NAME_LIMIT` code points. So a name can neither start a new line
+ * of a tool result or of the question, nor read in another order than it is.
+ */
+export function flatAppName(text: string): string {
+  const flat = text
+    .replace(/\p{Cs}/gu, "\uFFFD")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const points = [...flat];
+  return points.length <= APP_NAME_LIMIT ? flat : `${points.slice(0, APP_NAME_LIMIT - 1).join("").trimEnd()}…`;
+}
+
 /** `text` cut to `limit` characters plus a marker; `fullLength` is its length before the helper cut it. */
 export function cut(text: string, limit: number, marker: (length: number) => string, fullLength?: number): string {
   const characters = Array.from(text);

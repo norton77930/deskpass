@@ -27,6 +27,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   from its original name, or that has no version information, can now only be
   allowed once; for other apps the identity key and existing "Always allow"
   entries are unchanged. Helper protocol version 10.
+- Window titles and app names are quoted and escaped in every tool result
+  (`computer_list_windows`, a launch's window, and the messages that name a
+  dialog, a covering window or the new foreground), as the UI tree already
+  was: a title with line breaks could add lines that read as the tool's own.
+  An app name, which is its executable's file description and so chosen by
+  whoever built it, is also flattened to one line of at most 100 characters,
+  without bidi or zero-width characters, wherever Deskpass shows it, including
+  the approval question.
 
 ## [0.1.0] - 2026-11-04
 
