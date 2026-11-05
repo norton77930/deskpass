@@ -59,7 +59,7 @@ test("a signed app is logged by its signer and file name, a packaged one by its 
         // Ticket 95: both can be always allowed, so the dialog asks (Allow once).
         ask_user: [{ result: { answer: "allow" } }, { result: { answer: "allow" } }],
         app_identity: [
-          { result: { signed: true, signer: SIGNER, file_name: "demo.exe" } },
+          { result: { signed: true, signer: SIGNER, file_name: "demo.exe", original_name: "demo.exe" } },
           { result: { signed: false, signer: null, file_name: "demo.exe", package_family_name: "Contoso.Demo_8wekyb3d8bbwe" } },
         ],
       },
@@ -172,7 +172,7 @@ test("the identity is cached by path and modification time, and asked again when
         get_window: windows(5, window),
         ask_user: [{ result: { answer: "allow" } }],
         app_identity: [
-          { result: { signed: true, signer: SIGNER, file_name: "cached.exe" } },
+          { result: { signed: true, signer: SIGNER, file_name: "cached.exe", original_name: "cached.exe" } },
           { result: { signed: false, signer: null, file_name: "cached.exe" } },
         ],
       },

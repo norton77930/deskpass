@@ -40,7 +40,7 @@ const windowOf = (app: string, name: string, id: string, pid: number) => ({
 });
 const demo = windowOf(DEMO, "Demo", "5", 4242);
 
-const signedAs = (fileName: string): FakeHandler => ({ result: { signed: true, signer: SIGNER, file_name: fileName } });
+const signedAs = (fileName: string): FakeHandler => ({ result: { signed: true, signer: SIGNER, file_name: fileName, original_name: fileName } });
 const repeat = <T>(count: number, value: T): T[] => Array.from({ length: count }, () => value);
 
 let stamp = Date.parse("2026-05-01T00:00:00Z");

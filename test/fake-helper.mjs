@@ -79,7 +79,7 @@ async function handleLine(line) {
 
 function defaultStep(method, params) {
   if (method === "grant_mac") return grantMac(params);
-  if (method === "ping") return { result: { version: script.version ?? "9", ...(script.build === undefined ? {} : { build: script.build }) } };
+  if (method === "ping") return { result: { version: script.version ?? "10", ...(script.build === undefined ? {} : { build: script.build }) } };
   return { result: {} };
 }
 

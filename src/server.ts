@@ -2325,7 +2325,7 @@ async function raisedTierOf(helper: HelperPort, session: LiveSession, appPath: s
   if (!view.raisedKeys().some((key) => mayBeRaised(key, appPath))) return { tier: builtIn };
   const identity = await session.identify(helper, appPath);
   const key = identityKey(appPath, identity);
-  return { tier: await view.tierFor(key, classifyApp(appPath, ownPids, undefined, identity?.package_family_name)), key };
+  return { tier: await view.tierFor(key, classifyApp(appPath, ownPids, undefined, identity?.package_family_name, identity?.original_name)), key };
 }
 
 /**
@@ -2895,7 +2895,7 @@ async function authorize(mcp: Server, helper: HelperPort, approvals: SessionAppr
   const key = identityKey(info.app, identity);
   // Ticket 94: the user's grants and raised tiers, read again whenever grants.json changed.
   const grantView = info.app_unresolved ? null : await session.grants(helper);
-  const builtIn = classifyApp(info.app, ownPids, info.pid, identity?.package_family_name);
+  const builtIn = classifyApp(info.app, ownPids, info.pid, identity?.package_family_name, identity?.original_name);
   const tier = grantView ? await grantView.tierFor(key, builtIn) : builtIn;
   const app: NotedApp = { path: info.app, tier: tier.tier, key };
   helper.noteApp?.(app);

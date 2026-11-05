@@ -80,7 +80,7 @@ test("a non-json helper line fails that request and the server still answers the
 });
 
 test("an incompatible helper version is reported for every tool call", async () => {
-  const harness = await connectServer({ script: { version: "10" } });
+  const harness = await connectServer({ script: { version: "11" } });
   try {
     const first = await harness.client.callTool({ name: "computer_list_windows", arguments: {} });
     const second = await harness.client.callTool({ name: "computer_list_windows", arguments: {} });
@@ -88,8 +88,8 @@ test("an incompatible helper version is reported for every tool call", async () 
       assert.equal(result.isError, true);
       const text = textContent(result);
       assert.equal(text.split(/\r?\n/)[0], "helper_version_mismatch");
+      assert.match(text, /"11"/);
       assert.match(text, /"10"/);
-      assert.match(text, /"9"/);
     }
   } finally {
     await harness.close();

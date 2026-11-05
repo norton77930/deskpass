@@ -18,6 +18,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   cmd.exe, a blocked-tier terminal, while the approval named only the script.
 - `computer_launch_app` no longer looks a relative path up in the current
   directory: `app` is a full path or a name the App Paths registry knows.
+- A signed app is known by its signer only when its file name is the original
+  name in its version information. A signature covers a file's content but not
+  its name, so a copy of cmd.exe saved as notepad.exe verified as Microsoft's
+  Notepad and used Notepad's "Always allow"; saved as tool.exe it was a normal
+  app. It is now known by its path, and the risk tiers look at both names, so
+  any copy of a blocked program is blocked. A signed app whose file name differs
+  from its original name, or that has no version information, can now only be
+  allowed once; for other apps the identity key and existing "Always allow"
+  entries are unchanged. Helper protocol version 10.
 
 ## [0.1.0] - 2026-11-04
 

@@ -37,7 +37,7 @@ const demo = {
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const edge = { ...demo, window_id: "6", app: EDGE, app_name: "Microsoft Edge", title: "Edge", pid: 4343 };
 
-const signed = (signer = SIGNER, fileName = "demo.exe"): FakeHandler => ({ result: { signed: true, signer, file_name: fileName } });
+const signed = (signer = SIGNER, fileName = "demo.exe"): FakeHandler => ({ result: { signed: true, signer, file_name: fileName, original_name: fileName } });
 const unsigned = (fileName = "demo.exe"): FakeHandler => ({ result: { signed: false, signer: null, file_name: fileName } });
 const answer = (value: string): FakeHandler => ({ result: { answer: value } });
 const cannotShow: FakeHandler = { error: { code: "prompt_unavailable", message: "There is no interactive desktop." } };
@@ -378,6 +378,56 @@ test("a lone surrogate in the app's name or path is written as U+FFFD, so the he
     const signing = ((await harness.requests()) as Logged[]).filter((entry) => entry.method === "grant_mac");
     const fields = signing.flatMap((entry) => (entry.params?.entries as { fields: Record<string, unknown> }[]).flatMap((macEntry) => Object.values(macEntry.fields)));
     assert.equal(fields.some((value) => typeof value === "string" && /\p{Cs}/u.test(value)), false, "no grant_mac request holds a lone surrogate");
+  } finally {
+    await harness.close();
+  }
+});
+
+// A signature covers a file's content, never its name: a signed copy of another program saved
+// under an app's name is known by its path (its version resource names another program), and is in
+// the tier of either name.
+const copyOf = (originalName: string | null): FakeHandler => ({ result: { signed: true, signer: SIGNER, file_name: "demo.exe", original_name: originalName } });
+
+test("a signed copy of another program saved as an always-allowed app's name does not use its grant", async () => {
+  const first = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, signed()), ask_user: [answer("allow_always")] });
+  try {
+    assert.notEqual((await typeText(first)).isError, true);
+  } finally {
+    await first.finish();
+  }
+  const copy = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf("other.exe")), ask_user: [answer("deny")] }, { grantsDir: first.dir, elicitation: false });
+  try {
+    assert.equal(code(await typeText(copy)), "approval_declined");
+    // Asked, and without 永遠允許: it has no signer's identity.
+    assert.deepEqual(await asks(copy), [approveParams(false)]);
+    assert.deepEqual(await logged(copy, "grant_mismatch"), [{ event: "grant_mismatch", key: DEMO_KEY, current_key: "c:\\apps\\demo.exe", path: demo.app }]);
+    assert.equal((await grantsFile(first.dir))?.grants[0]?.key, DEMO_KEY, "the grant itself is kept");
+  } finally {
+    await copy.close();
+    await first.close();
+  }
+});
+
+test("a copy of a shell under another name is in the blocked tier: refused without asking, whatever grant its name has", async () => {
+  for (const original of ["cmd.exe", "PowerShell.EXE", "wt.exe"]) {
+    const harness = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf(original.toLowerCase())) });
+    try {
+      const result = await typeText(harness);
+      assert.equal(code(result), "blocked_app", original);
+      assert.match(textContent(result), /blocked tier/i, original);
+      assert.deepEqual(await asks(harness), [], original);
+      assert.equal(harness.elicitations.length, 0, original);
+    } finally {
+      await harness.close();
+    }
+  }
+});
+
+test("a signed app whose version resource names no program is asked allow-once only", async () => {
+  const harness = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf(null)), ask_user: [answer("allow")] }, { elicitation: false });
+  try {
+    assert.notEqual((await typeText(harness)).isError, true);
+    assert.deepEqual(await asks(harness), [approveParams(false)]);
   } finally {
     await harness.close();
   }

@@ -188,11 +188,14 @@ export function packageFamilyFromPath(appPath: string): string | null {
  * Ticket 91: the tier of `appPath`, by executable name (without regard to case) and, for a UWP
  * app, package family name; a process of this server or its helper (`ownPids`) is blocked.
  * `packageFamily` is the one ticket 93's app identity reports; when the identity could not be had,
- * the family is read from the install folder (`packageFamilyFromPath`).
+ * the family is read from the install folder (`packageFamilyFromPath`). `originalName` is the
+ * identity's `original_name`: the app is in the strictest tier either of its names is in, so a
+ * copy of cmd.exe saved under another name is still blocked. It can only make an app stricter.
  */
-export function classifyApp(appPath: string, ownPids: number[], pid?: number, packageFamily?: string): TierMatch {
+export function classifyApp(appPath: string, ownPids: number[], pid?: number, packageFamily?: string, originalName?: string | null): TierMatch {
   if (pid !== undefined && ownPids.includes(pid)) return { tier: "blocked", why: OWN_PROCESS_WHY };
-  const match = builtInGroup([executableStem(appPath)], [packageFamily ?? packageFamilyFromPath(appPath)]);
+  const stems = [executableStem(appPath), ...(originalName ? [executableStem(originalName)] : [])];
+  const match = builtInGroup(stems, [packageFamily ?? packageFamilyFromPath(appPath)]);
   return match ? { tier: match.tier, why: match.group.why } : { tier: "normal", why: null };
 }
 

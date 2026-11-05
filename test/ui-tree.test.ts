@@ -305,13 +305,13 @@ test("after the helper crashes, the next read starts a session on the new helper
   }
 });
 
-test("an old helper of protocol version 2 (before element clicks), 3 (before set_value), 4 (before element_action), 5 (before paste_text and list_apps) 6 (before allow_always), 7 (before read_clipboard) or 8 (before list_start_menu_apps and confirm_change) is refused", async () => {
-  for (const version of ["2", "3", "4", "5", "6", "7", "8"]) {
+test("an old helper of protocol version 2 (before element clicks), 3 (before set_value), 4 (before element_action), 5 (before paste_text and list_apps) 6 (before allow_always), 7 (before read_clipboard), 8 (before list_start_menu_apps and confirm_change) or 9 (before original_name) is refused", async () => {
+  for (const version of ["2", "3", "4", "5", "6", "7", "8", "9"]) {
     const harness = await connectServer({ script: { version } });
     try {
       const result = await readTree(harness);
       assert.equal(textContent(result).split(/\r?\n/)[0], "helper_version_mismatch");
-      assert.match(textContent(result), new RegExp(`"${version}" is not compatible with server protocol version "9"`));
+      assert.match(textContent(result), new RegExp(`"${version}" is not compatible with server protocol version "10"`));
     } finally {
       await harness.close();
     }

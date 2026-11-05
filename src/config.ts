@@ -10,9 +10,10 @@ export const SERVER_VERSION = "0.1.0";
  * `list_apps`; version 7 (ticket 95) adds `ask_user`'s `allow_always` and its answer `allow_always`, and drops `grant_mac`'s
  * `key_path` (the helper keeps its key in its own folder, or the `--grants-dir` it is started with); version 8 (ticket 97)
  * adds `read_clipboard` and `ask_user`'s kind `read_clipboard`; version 9 adds `list_start_menu_apps` (ticket 116) and
- * `confirm_change` (ticket 114), which the settings server (ticket 115) needs.
+ * `confirm_change` (ticket 114), which the settings server (ticket 115) needs; version 10 adds `app_identity`'s
+ * `original_name`, without which a signed file is known by its path.
  */
-export const PROTOCOL_VERSION = "9";
+export const PROTOCOL_VERSION = "10";
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 export const LAUNCH_APP_TIMEOUT_MS = 15_000;

@@ -12,32 +12,61 @@ export interface AppIdentity {
   signer: string | null;
   /** Lower case. */
   file_name: string;
+  /**
+   * The `OriginalFilename` of the executable's own version resource, lower case, without `.mui`
+   * (`cmd.exe` for any copy of cmd.exe, whatever it is called); null when it has none. The
+   * signature covers it, as it never covers the file name.
+   */
+  original_name: string | null;
   package_family_name?: string;
 }
 
 /** A well-formed `app_identity` result, or null (then the app is treated as unsigned). */
 export function readAppIdentity(result: unknown): AppIdentity | null {
   if (typeof result !== "object" || result === null) return null;
-  const { signed, signer, file_name: fileName, package_family_name: family } = result as Record<string, unknown>;
+  const { signed, signer, file_name: fileName, original_name: original, package_family_name: family } = result as Record<string, unknown>;
   if (typeof signed !== "boolean" || typeof fileName !== "string" || fileName.length === 0) return null;
   if (signed && (typeof signer !== "string" || signer.length === 0)) return null;
   if (family !== undefined && (typeof family !== "string" || family.length === 0)) return null;
-  return { signed, signer: signed ? (signer as string) : null, file_name: fileName.toLowerCase(), ...(family === undefined ? {} : { package_family_name: family }) };
+  if (original !== undefined && original !== null && (typeof original !== "string" || original.length === 0)) return null;
+  return {
+    signed,
+    signer: signed ? (signer as string) : null,
+    file_name: fileName.toLowerCase(),
+    original_name: typeof original === "string" ? original.toLowerCase() : null,
+    ...(family === undefined ? {} : { package_family_name: family }),
+  };
+}
+
+/** A file name without `.exe`, lower case: how a file name and an original name are compared. */
+function programStem(name: string): string {
+  return name.toLowerCase().replace(/\.exe$/, "");
+}
+
+/**
+ * Whether the signed file `fileName` is the program its version resource names (`original_name`).
+ * A signature covers a file's content, never its name: a copy of cmd.exe saved as notepad.exe
+ * verifies as Microsoft's, and would otherwise be known as Notepad (and use its always-allow).
+ */
+export function isOriginalName(fileName: string, originalName: string | null): boolean {
+  return originalName !== null && originalName.length > 0 && programStem(originalName) === programStem(fileName);
 }
 
 /**
  * Ticket 93: the key an app is known by in the log, and (tickets 94, 95) in its grants and this
  * session's approvals:
  * - a packaged app: `package:` and its package family name, lower case;
- * - a signed app: `signer:`, the signer's subject as the helper reports it, `|` and the file name in
- *   lower case (a file name cannot hold `|`, so the last `|` splits the two);
+ * - a signed app whose file name is its original name (`isOriginalName`): `signer:`, the signer's
+ *   subject as the helper reports it, `|` and the file name in lower case (a file name cannot hold
+ *   `|`, so the last `|` splits the two);
  * - anything else, including an app whose identity could not be had: its normalized path
  *   (`appKey`), as the log had it before this ticket. A path begins with a drive or `\\`, so it
  *   never reads as one of the other two.
  */
 export function identityKey(appPath: string, identity: AppIdentity | null): string {
   if (identity?.package_family_name) return `package:${identity.package_family_name.toLowerCase()}`;
-  if (identity?.signed && identity.signer) return `signer:${identity.signer}|${identity.file_name}`;
+  // Only a file that is the program its version resource names; a renamed copy is known by its path.
+  if (identity?.signed && identity.signer && isOriginalName(identity.file_name, identity.original_name)) return `signer:${identity.signer}|${identity.file_name}`;
   return appKey(appPath);
 }
 

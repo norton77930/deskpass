@@ -100,8 +100,9 @@ fn main() {
 /// `ask_user`'s `allow_always` and its answer `allow_always`, and `grant_mac` without `key_path`
 /// (the key in the helper's own folder, or `--grants-dir`) (95); 8 `read_clipboard` and
 /// `ask_user`'s kind `read_clipboard` (97); 9 `list_start_menu_apps` (116) and `confirm_change`
-/// (114), which the settings server uses (115).
-const PROTOCOL_VERSION: &str = "9";
+/// (114), which the settings server uses (115); 10 `app_identity`'s `original_name`, without which a
+/// signed file is known by its path.
+const PROTOCOL_VERSION: &str = "10";
 
 /// Methods that send input. While stopped they are answered `interrupted` without running.
 /// `click` covers a click on an element too (ticket 62); `set_value` and `element_action` are the

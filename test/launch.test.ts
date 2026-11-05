@@ -357,3 +357,25 @@ test("an app_id whose shortcut resolves to a script is not launched", async () =
     await harness.close();
   }
 });
+
+test("a renamed copy of a shell is refused at its launch, before it is started", async () => {
+  const copy = String.raw`C:\Users\me\Downloads\tool.exe`;
+  const harness = await connectServer({
+    elicitation: "form",
+    resolveApp: async () => copy,
+    script: {
+      handlers: {
+        app_identity: [{ result: { signed: true, signer: "C=US, S=Washington, L=Redmond, O=Microsoft Corporation, CN=Microsoft Windows", file_name: "tool.exe", original_name: "cmd.exe" } }],
+        launch_app: [{ result: launched }],
+      },
+    },
+  });
+  try {
+    const result = await harness.client.callTool({ name: "computer_launch_app", arguments: { app: copy } });
+    assert.equal(textContent(result).split(/\r?\n/)[0], "blocked_app");
+    assert.equal(harness.elicitations.length, 0);
+    assert.equal(sent(await harness.requests(), "launch_app").length, 0);
+  } finally {
+    await harness.close();
+  }
+});

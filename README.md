@@ -218,7 +218,9 @@ Reproducible numbers only; no speed or success-rate benchmarks.
   elevates itself.
 - Unsigned apps are recognised by their path: if one moves, or later ships
   signed, the choices you made for it (for example blocking it) no longer apply,
-  and the log does not point this out.
+  and the log does not point this out. So is a signed app whose file name is not
+  the name in its version information (a renamed copy), or that has none: it can
+  only be allowed once.
 - The AI cannot type or paste into password fields and asks you to type instead,
   but a password field the app does not mark as one is not recognised.
 - Typing and key presses follow the app's pace, slower than pasting; long text is
