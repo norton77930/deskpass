@@ -75,7 +75,8 @@ test("switching windows updates the overlay target", async () => {
 test("the overlay hides after the idle interval", async () => {
   const harness = await connectServer({
     elicitation: "form",
-    overlayIdleMs: 40,
+    // Long enough that a loaded machine reads the requests before the interval ends.
+    overlayIdleMs: 5_000,
     script: {
       handlers: {
         get_window: [{ result: openWindow }],
@@ -84,12 +85,12 @@ test("the overlay hides after the idle interval", async () => {
     },
   });
   try {
+    const hides = async () => (await harness.requests()).filter((entry) => (entry as { method?: string }).method === "overlay_hide");
     await harness.client.callTool({ name: "computer_screenshot", arguments: { window_id: "5" } });
-    const before = (await harness.requests()).filter((entry) => (entry as { method?: string }).method === "overlay_hide");
-    assert.equal(before.length, 0);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const after = (await harness.requests()).filter((entry) => (entry as { method?: string }).method === "overlay_hide");
-    assert.equal(after.length, 1);
+    assert.equal((await hides()).length, 0);
+    const deadline = Date.now() + 30_000;
+    while ((await hides()).length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await hides()).length, 1);
   } finally {
     await harness.close();
   }

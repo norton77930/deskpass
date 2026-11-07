@@ -39,11 +39,11 @@ async function logEvents(harness: Harness): Promise<Record<string, unknown>[]> {
   return events;
 }
 
-test("computer_read_clipboard is listed with only an optional action_summary, making 19 tools", async () => {
+test("computer_read_clipboard is listed with only an optional action_summary, making 21 tools", async () => {
   const harness = await connectServer();
   try {
     const tools = (await harness.client.listTools()).tools;
-    assert.equal(tools.length, 19);
+    assert.equal(tools.length, 21);
     const tool = tools.find((entry) => entry.name === "computer_read_clipboard");
     assert.ok(tool);
     assert.deepEqual(Object.keys(tool.inputSchema.properties ?? {}), ["action_summary"]);

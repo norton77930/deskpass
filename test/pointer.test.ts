@@ -179,7 +179,7 @@ test("scroll and drag after which the foreground moved succeed and name the new 
   });
   try {
     await prepare(harness);
-    const scrolled = await harness.client.callTool({ name: "computer_scroll", arguments: { window_id: "5", x: 20, y: 30, direction: "down" } });
+    const scrolled = await harness.client.callTool({ name: "computer_scroll", arguments: { window_id: "5", x: 20, y: 30, direction: "down", delivery_mode: "foreground" } });
     assert.notEqual(scrolled.isError, true);
     assert.equal(
       textContent(scrolled),

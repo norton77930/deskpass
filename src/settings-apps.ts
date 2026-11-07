@@ -24,6 +24,8 @@ export interface LoggedUse {
   key: string;
   path: string;
   time: number;
+  /** The log's `prior_key`: the signer's key the app had before the original-name rule. */
+  priorKey?: string;
 }
 
 /**
@@ -51,10 +53,10 @@ export async function recentLogUses(logDir: string): Promise<LoggedUse[]> {
       if (typeof event !== "object" || event === null) continue;
       const { app, time } = event as { app?: unknown; time?: unknown };
       if (typeof app !== "object" || app === null) continue;
-      const { key, path: appPath } = app as { key?: unknown; path?: unknown };
+      const { key, path: appPath, prior_key: priorKey } = app as { key?: unknown; path?: unknown; prior_key?: unknown };
       if (typeof key !== "string" || key.length === 0 || typeof appPath !== "string") continue;
       const at = typeof time === "string" ? Date.parse(time) : Number.NaN;
-      uses.push({ key, path: appPath, time: at });
+      uses.push({ key, path: appPath, time: at, ...(typeof priorKey === "string" && priorKey.length > 0 ? { priorKey } : {}) });
     }
   }
   return uses;
@@ -235,6 +237,7 @@ export function grantsState(verdict: GrantVerdict, T: SettingsText = SETTINGS_TE
  * use (the newer of its grant's `last_used_at` and its newest log event); newest use first, apps
  * without one last, the same time (or none) by name, compared lower-cased. Ticket 133: only these
  * apps are rows; the Start Menu (`menu`) gives them their names. Their sentences are in the language of `T`.
+ * A use whose app has a raise under its prior key counts for that key's row, the raise that is in force.
  */
 export async function appRows(view: GrantView, logged: LoggedUse[], menu: StartMenu, T: SettingsText = SETTINGS_TEXT): Promise<SettingsApp[]> {
   const { names } = menu;
@@ -247,12 +250,14 @@ export async function appRows(view: GrantView, logged: LoggedUse[], menu: StartM
   };
   for (const grant of grants) add(grant.key, grant.path);
   for (const raise of raised) add(raise.key, null);
-  for (const use of logged) add(use.key, use.path);
+  const rowKey = (use: LoggedUse) => (use.priorKey !== undefined && raised.some((entry) => entry.key === use.priorKey) ? use.priorKey : use.key);
+  for (const use of logged) add(rowKey(use), use.path);
 
   const lastLogged = new Map<string, number>();
   for (const use of logged) {
     if (!Number.isFinite(use.time)) continue;
-    lastLogged.set(use.key, Math.max(lastLogged.get(use.key) ?? Number.NEGATIVE_INFINITY, use.time));
+    const key = rowKey(use);
+    lastLogged.set(key, Math.max(lastLogged.get(key) ?? Number.NEGATIVE_INFINITY, use.time));
   }
 
   const rows: (SettingsApp & { lastMs: number | null })[] = [];

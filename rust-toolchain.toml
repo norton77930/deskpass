@@ -1,0 +1,5 @@
+# The Rust toolchain the helper is built and tested with, here and in CI (.github/workflows), so a
+# release is built by a known compiler. Raise it on purpose, in its own change.
+[toolchain]
+channel = "1.97.0"
+profile = "minimal"

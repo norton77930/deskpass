@@ -32,7 +32,7 @@ export function readDeliveryMode(value: unknown, fallback: DeliveryMode): Delive
  * spec-background "`background_unavailable`": why an action could not be delivered in the
  * background. The helper answers the same reasons (`input::BackgroundReason`).
  */
-export type BackgroundUnavailableReason = "needs_pointer" | "no_click_pattern" | "no_element_at_point" | "focus_needs_foreground" | "minimized" | "tool_needs_foreground";
+export type BackgroundUnavailableReason = "needs_pointer" | "no_click_pattern" | "no_element_at_point" | "focus_needs_foreground" | "minimized" | "no_scroll_pattern" | "tool_needs_foreground";
 
 export const BACKGROUND_UNAVAILABLE = "background_unavailable";
 
@@ -50,6 +50,7 @@ const WHY: Record<BackgroundUnavailableReason, string> = {
   no_element_at_point: "No element that can be acted on was found at that point of the target window, so the click cannot be delivered in the background",
   focus_needs_foreground: "Moving the keyboard focus brings the window forward, so focus cannot be delivered in the background",
   minimized: "The target window is minimized, so the action cannot be delivered in the background",
+  no_scroll_pattern: "Nothing at that point of the target window scrolls in that direction, so the scroll cannot be delivered in the background",
   tool_needs_foreground: "This tool needs real keyboard or pointer input, so it cannot be delivered in the background",
 };
 

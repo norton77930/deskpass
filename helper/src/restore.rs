@@ -9,8 +9,10 @@
 
 use std::cell::RefCell;
 #[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
@@ -90,6 +92,17 @@ impl Watched {
     fn is_target(&self, activation: Activation) -> bool {
         activation.pid == self.target_pid || activation.root == self.target
     }
+}
+
+/// How long a watch goes on after its request was answered, for an action whose UI Automation call
+/// was still running when the request timed out (`ForegroundWatch::finish_when`): the call cannot be
+/// cancelled, so the app may still take the action, and the foreground, once it answers.
+pub(crate) const LATE_ACTION_WATCH: Duration = Duration::from_secs(30);
+
+/// Whether a late watch (`finish_when`) can stop waiting for its action at `now`: the action's call
+/// returned, or `LATE_ACTION_WATCH` has passed since `since`.
+pub(crate) fn late_wait_over(returned: bool, since: Instant, now: Instant) -> bool {
+    returned || now >= since + LATE_ACTION_WATCH
 }
 
 /// Whether the watch is over at `now`: only once the action returned (`returned`) and
@@ -190,11 +203,59 @@ pub fn debug_refused_restores() -> serde_json::Value {
 /// Posted to the watch's thread once the action returned, which starts `WATCH_AFTER_ACTION`.
 const WM_ACTION_RETURNED: u32 = WM_APP + 1;
 
+/// Posted to a late watch's thread when a request brings its target to the foreground: the watch
+/// ends at once, without `WATCH_AFTER_ACTION` (`end_late_watches`).
+const WM_WATCH_ENDED: u32 = WM_APP + 2;
+
+/// How long `end_late_watches` waits for the watches it ended to be gone: each only has to read its
+/// message, within a look at the foreground, and be joined.
+const LATE_WATCH_END_WAIT: Duration = Duration::from_millis(250);
+
+/// A watch kept past its request (`finish_when`).
+struct LateWatch {
+    target: isize,
+    target_pid: u32,
+    thread: u32,
+    /// `end_late_watches` ended it.
+    ended: AtomicBool,
+}
+
+impl LateWatch {
+    fn is_about(&self, target: isize, target_pid: u32) -> bool {
+        self.target == target || (target_pid != 0 && self.target_pid == target_pid)
+    }
+}
+
+static LATE_WATCHES: Mutex<Vec<Arc<LateWatch>>> = Mutex::new(Vec::new());
+
+fn late_watches() -> std::sync::MutexGuard<'static, Vec<Arc<LateWatch>>> {
+    LATE_WATCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A request is about to bring `target` to the foreground: a late watch on it would take the
+/// foreground straight back (`Watched::verdict`), and input could reach whatever is in front by then.
+/// Ends such watches and waits for them to be gone. The request now decides who holds the foreground.
+pub(crate) unsafe fn end_late_watches(target: HWND) {
+    let mut target_pid = 0u32;
+    GetWindowThreadProcessId(target, Some(&mut target_pid));
+    let target = target.0 as isize;
+    for watch in late_watches().iter().filter(|watch| watch.is_about(target, target_pid)) {
+        watch.ended.store(true, Ordering::SeqCst);
+        let _ = PostThreadMessageW(watch.thread, WM_WATCH_ENDED, WPARAM(0), LPARAM(0));
+    }
+    let started = Instant::now();
+    while started.elapsed() < LATE_WATCH_END_WAIT && late_watches().iter().any(|watch| watch.is_about(target, target_pid)) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// One action's watch, on a thread of its own that pumps messages, so the out-of-context
 /// `EVENT_SYSTEM_FOREGROUND` hook calls back there as soon as a window takes the foreground
 /// (`watch`).
 pub(crate) struct ForegroundWatch {
     thread: u32,
+    target: isize,
+    target_pid: u32,
     handle: std::thread::JoinHandle<Report>,
 }
 
@@ -224,7 +285,7 @@ impl ForegroundWatch {
         let (ready, started) = mpsc::channel();
         let handle = std::thread::spawn(move || watch(watched, anchor, ready));
         match started.recv() {
-            Ok(Some(thread)) => Some(ForegroundWatch { thread, handle }),
+            Ok(Some(thread)) => Some(ForegroundWatch { thread, target: watched.target, target_pid, handle }),
             _ => {
                 let _ = handle.join();
                 eprintln!("foreground restore: could not watch the foreground, so a target that takes it keeps it");
@@ -240,6 +301,28 @@ impl ForegroundWatch {
             let _ = PostThreadMessageW(self.thread, WM_ACTION_RETURNED, WPARAM(0), LPARAM(0));
         }
         self.handle.join().unwrap_or(Report::Unchanged)
+    }
+
+    /// The request timed out while the action's call was still running, and was answered: the
+    /// watch goes on, on a thread of its own, until `returned` is set (the call came back) or for
+    /// `LATE_ACTION_WATCH`, and then ends as `finish` ends it, so a target that takes the foreground
+    /// when it finally acts is still given back (ADR 0002). What it would report goes nowhere. It
+    /// still ends early when another app takes the foreground, as every watch does, and when a
+    /// request brings the target to the foreground itself (`end_late_watches`).
+    pub(crate) fn finish_when(self, returned: Arc<AtomicBool>) {
+        let since = Instant::now();
+        let late = Arc::new(LateWatch { target: self.target, target_pid: self.target_pid, thread: self.thread, ended: AtomicBool::new(false) });
+        late_watches().push(late.clone());
+        std::thread::spawn(move || {
+            while !late_wait_over(returned.load(Ordering::SeqCst) || late.ended.load(Ordering::SeqCst), since, Instant::now()) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let report = self.finish();
+            late_watches().retain(|watch| !Arc::ptr_eq(watch, &late));
+            if matches!(report, Report::RestoreFailed) && !late.ended.load(Ordering::SeqCst) {
+                eprintln!("foreground restore: a late action's target kept the foreground");
+            }
+        });
     }
 }
 
@@ -277,17 +360,20 @@ fn watch(watched: Watched, anchor: Option<isize>, ready: mpsc::Sender<Option<u32
         };
         let _ = ready.send(Some(GetCurrentThreadId()));
         let mut returned = None;
+        let mut ended_by_request = false;
         loop {
             let _ = MsgWaitForMultipleObjectsEx(Some(&[timer]), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             // Delivers the hook's events too.
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                 if message.message == WM_ACTION_RETURNED {
                     returned = Some(Instant::now());
+                } else if message.message == WM_WATCH_ENDED {
+                    ended_by_request = true;
                 } else {
                     DispatchMessageW(&message);
                 }
             }
-            if ended() || watch_over(returned, Instant::now()) {
+            if ended_by_request || ended() || watch_over(returned, Instant::now()) {
                 break;
             }
             respond(activation(GetForegroundWindow()));
@@ -473,7 +559,41 @@ unsafe fn anchor_above(target: HWND) -> Option<HWND> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_late_watch_waits_for_its_action_at_most_late_action_watch() {
+        let since = Instant::now();
+        assert!(!super::late_wait_over(false, since, since));
+        assert!(!super::late_wait_over(false, since, since + super::LATE_ACTION_WATCH - Duration::from_millis(1)));
+        assert!(super::late_wait_over(false, since, since + super::LATE_ACTION_WATCH));
+        assert!(super::late_wait_over(true, since, since), "a call that returned ends the wait at once");
+    }
+
     use super::*;
+
+    /// A window handle no window has: the watch's target never takes the foreground.
+    const NO_WINDOW: isize = 0x7ffe_0010;
+
+    #[test]
+    fn a_request_for_the_target_ends_its_late_watch_at_once() {
+        let target = HWND(NO_WINDOW as *mut core::ffi::c_void);
+        let user = HWND((NO_WINDOW + 16) as *mut core::ffi::c_void);
+        let watch = unsafe { ForegroundWatch::start(target, user) }.expect("the watch starts");
+        // Its action never returns, so only `end_late_watches` can end it before 30 s.
+        watch.finish_when(Arc::new(AtomicBool::new(false)));
+        assert!(late_watches().iter().any(|watch| watch.target == NO_WINDOW));
+        unsafe { end_late_watches(target) };
+        assert!(!late_watches().iter().any(|watch| watch.target == NO_WINDOW), "gone before the request goes on");
+    }
+
+    #[test]
+    fn a_late_watch_is_about_its_window_and_its_process() {
+        let watch = LateWatch { target: 1, target_pid: 7, thread: 0, ended: AtomicBool::new(false) };
+        assert!(watch.is_about(1, 8), "the window");
+        assert!(watch.is_about(2, 7), "another window of the process");
+        assert!(!watch.is_about(2, 8));
+        let no_process = LateWatch { target: 1, target_pid: 0, thread: 0, ended: AtomicBool::new(false) };
+        assert!(!no_process.is_about(2, 0), "no process is nobody's process");
+    }
 
     const USER: isize = 0x100;
     const TARGET: isize = 0x200;

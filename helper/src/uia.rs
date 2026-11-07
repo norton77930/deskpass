@@ -18,7 +18,10 @@
 //! each tree are kept (the newest `TREES_PER_WINDOW` trees per window) for the element actions:
 //! a `click` on an element reads its position again when it clicks (ticket 62, `element_point`),
 //! and `set_value` (64) and `element_action` (65) find the element again and act on it on the
-//! worker (`act_on_element`).
+//! worker (`act_on_element`). `find_in_ui_tree` (reference-gaps G2) is the same walk with a query
+//! that keeps nothing, for polling. `get_ui_tree` can start at one element of a kept tree
+//! (reference-gaps G3, `root_ref`): the element is found again like an element action's, and the
+//! walk is it and what is below it, without the window's popups (`walk_roots`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
@@ -31,20 +34,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
-    AutomationElementMode_Full, CUIAutomation, ExpandCollapseState, ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded, ExpandCollapseState_LeafNode,
+    AutomationElementMode_Full, CUIAutomation, ScrollAmount, ScrollAmount_NoAmount, ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement, ExpandCollapseState, ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded, ExpandCollapseState_LeafNode,
     ExpandCollapseState_PartiallyExpanded, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationExpandCollapsePattern, IUIAutomationInvokePattern,
-    IUIAutomationRangeValuePattern, IUIAutomationScrollItemPattern, IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern, IUIAutomationTreeWalker,
+    IUIAutomationRangeValuePattern, IUIAutomationScrollItemPattern, IUIAutomationScrollPattern, IUIAutomationSelectionItemPattern, IUIAutomationTextPattern, IUIAutomationTogglePattern, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, ToggleState, ToggleState_Indeterminate, ToggleState_Off, ToggleState_On, TreeScope, TreeScope_Children, TreeScope_Element,
     UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_ExpandCollapsePatternId,
     UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
-    UIA_NamePropertyId, UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId, UIA_ScrollItemPatternId, UIA_SelectionItemIsSelectedPropertyId,
-    UIA_SelectionItemPatternId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId, UIA_CONTROLTYPE_ID,
+    UIA_NamePropertyId, UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId, UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_SelectionItemPatternId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId, UIA_CONTROLTYPE_ID,
     UIA_PATTERN_ID, UIA_PROPERTY_ID,
 };
-use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    ChildWindowFromPointEx, EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsWindow, PostMessageW, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+};
 
 use crate::capture;
 use crate::input::{background_unavailable, BackgroundReason, Delivery};
@@ -280,11 +286,14 @@ struct Walked<E> {
     /// for it ended (`wait_for_web_content`); false when it had some, was no such window, or the
     /// wait did not end.
     web_content_empty: bool,
+    /// Reference-gaps G3: the element a subtree is read from (`role` and `name`, as it is now);
+    /// None for a whole tree, and for a subtree whose root was not found.
+    root: Option<Value>,
 }
 
 impl<E> Default for Walked<E> {
     fn default() -> Self {
-        Self { elements: Vec::new(), refs: Vec::new(), focused_index: None, truncated: Vec::new(), omitted_children: 0, web_content_empty: false }
+        Self { elements: Vec::new(), refs: Vec::new(), focused_index: None, truncated: Vec::new(), omitted_children: 0, web_content_empty: false, root: None }
     }
 }
 
@@ -299,23 +308,104 @@ struct Scope {
     title: String,
 }
 
+/// Reference-gaps G3: how much of the tree `get_ui_tree` was asked to show. `find_in_ui_tree`
+/// takes neither, so it always reads with the default.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Shape {
+    /// Levels of the shown tree (1 to `DEPTH_LIMIT`). None is `DEPTH_LIMIT`, whose cut keeps the
+    /// marks it always had.
+    max_depth: Option<usize>,
+    /// Only the numbered elements (those matching a query, with one) and their ancestors.
+    interactive_only: bool,
+}
+
+impl Shape {
+    fn from_params(params: &Value) -> Result<Self, Failure> {
+        let invalid = |message: String| Failure::from(("invalid_params".to_string(), message));
+        let max_depth = match params.get("max_depth") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(depth) if (1..=DEPTH_LIMIT as u64).contains(&depth) => Some(depth as usize),
+                _ => return Err(invalid(format!("max_depth must be a whole number from 1 to {DEPTH_LIMIT}."))),
+            },
+        };
+        let interactive_only = match params.get("interactive_only") {
+            None => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(invalid("interactive_only must be true or false.".to_string())),
+        };
+        Ok(Self { max_depth, interactive_only })
+    }
+}
+
 enum Ended {
     Whole,
     OutOfTime,
     Stopped,
     Failed(String),
+    /// Reference-gaps G3: the root of a subtree could not be found again (`element_not_found`, and
+    /// the other answers of `resolve`); the request fails with this.
+    Rejected(Failure),
+}
+
+/// Reference-gaps G3 (ticket 06): the element a `get_ui_tree` read starts at, from
+/// `root_element_index` and the `tree_id` it is in (both, or neither). None reads the window.
+fn root_ref(params: &Value) -> Result<Option<ElementRef>, Failure> {
+    let invalid = |message: &str| Failure::from(("invalid_params".to_string(), message.to_string()));
+    let Some(index) = params.get("root_element_index") else {
+        return match params.get("tree_id") {
+            None => Ok(None),
+            Some(_) => Err(invalid("tree_id is only used with root_element_index.")),
+        };
+    };
+    let index = index.as_u64().filter(|index| *index >= 1).and_then(|index| usize::try_from(index).ok());
+    let index = index.ok_or_else(|| invalid("root_element_index must be a whole number from 1."))?;
+    let tree_id = params.get("tree_id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| invalid("tree_id is required with root_element_index."))?;
+    Ok(Some(ElementRef { tree_id: tree_id.to_string(), index }))
+}
+
+/// What a walk starts from. A whole window: its children, then each of its `popups` (looked up
+/// only here: a stop while they are is the walk's `Stopped`). Reference-gaps G3: a subtree, the
+/// `subtree` root alone at level 0, and no popups.
+fn walk_roots<N>(window: N, subtree: Option<N>, popups: impl FnOnce() -> Result<Vec<N>, Ended>) -> Result<Vec<Root<N>>, Ended> {
+    if let Some(root) = subtree {
+        return Ok(vec![Root::Itself(root)]);
+    }
+    let mut roots = vec![Root::ChildrenOf(window)];
+    roots.extend(popups()?.into_iter().map(Root::Itself));
+    Ok(roots)
 }
 
 pub fn get_ui_tree(params: &Value) -> Result<Value, Failure> {
+    read_tree(params, true)
+}
+
+/// Reference-gaps G2: whether the window's tree holds a match for `query` (required), by the rule
+/// of `get_ui_tree`'s `query` (same walk, same limits, password boxes never searched), without
+/// keeping the tree: its element references are released, it gets no `tree_id`, and the window's
+/// kept trees (`TREES_PER_WINDOW`) are as they were. So a caller can poll as often as it likes
+/// without dropping the trees a model holds. The answer is `{found}`, and `truncated` (as
+/// `get_ui_tree`) when the walk was cut short: a read that found nothing then may have missed it.
+pub fn find_in_ui_tree(params: &Value) -> Result<Value, Failure> {
+    read_tree(params, false)
+}
+
+fn read_tree(params: &Value, keep: bool) -> Result<Value, Failure> {
     let window_id = params.get("window_id").and_then(Value::as_str).unwrap_or("");
     let hwnd = parse_hwnd(window_id).ok_or_else(|| ("invalid_params".to_string(), "window_id is not a window handle.".to_string()))?;
     // Ticket 63: an optional text; empty is no query.
+    // Reference-gaps G3: only `get_ui_tree` takes these; `find_in_ui_tree` never reads them.
+    let shape = if keep { Shape::from_params(params)? } else { Shape::default() };
+    let root = if keep { root_ref(params)? } else { None };
     let query = match params.get("query") {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) if text.is_empty() => None,
         Some(Value::String(text)) => Some(fold(text)),
         Some(_) => return Err(("invalid_params".to_string(), "query must be text.".to_string()).into()),
     };
+    if !keep && query.is_none() {
+        return Err(("invalid_params".to_string(), "query is required, and must not be empty.".to_string()).into());
+    }
     // `get_window` refuses the helper's own windows (the approval dialog, the overlay) first.
     let info = windows_list::get_window(window_id)?;
     // Before the elevated check, as on the first version's paths: a window swapped to another
@@ -344,13 +434,15 @@ pub fn get_ui_tree(params: &Value) -> Result<Value, Failure> {
     let walked = Arc::new(Mutex::new(Walked::default()));
     let shared = Arc::clone(&walked);
     let target = scope.target;
-    let ended = match run_on_worker(deadline, move |automation| walk(automation, &scope, query.as_deref(), &shared, deadline)) {
+    // Reference-gaps G3: where the root is looked for again, as an element action looks for its element.
+    let subtree = root.map(|root| (root, Placement { target, owner: owner_of(target), frame, popups: scope.popups.clone(), monitors: Vec::new() }));
+    let ended = match run_on_worker(deadline, move |automation| walk(automation, &scope, query.as_deref(), shape, subtree.as_ref(), &shared, deadline)) {
         Ok(ended) => ended,
         Err(WorkerError::TimedOut) => Ended::OutOfTime,
         Err(WorkerError::Unavailable(message)) => Ended::Failed(message),
     };
     // A walk left behind may still add to its copy; this tree is what it had reached now.
-    let Walked { elements, refs, focused_index, mut truncated, omitted_children, web_content_empty } = std::mem::take(&mut *lock(&walked));
+    let Walked { elements, refs, focused_index, mut truncated, omitted_children, web_content_empty, root } = std::mem::take(&mut *lock(&walked));
     let refs = Unkept(refs);
     // That walk may add references until it ends, so whichever of it and this call lets go of the
     // buffer last does so on the worker.
@@ -360,6 +452,7 @@ pub fn get_ui_tree(params: &Value) -> Result<Value, Failure> {
         // A walk that failed or ended while stopped is also cut short by the stop.
         Ended::Stopped => return Err(interrupted()),
         _ if esc::stopped() => return Err(interrupted()),
+        Ended::Rejected(failure) => return Err(failure),
         Ended::Failed(_) if closed() => return Err(("window_not_found".to_string(), "The window is no longer open.".to_string()).into()),
         Ended::Failed(message) => return Err(("internal".to_string(), format!("The UI tree could not be read: {message}")).into()),
         Ended::Whole | Ended::OutOfTime if closed() => return Err(("window_not_found".to_string(), "The window is no longer open.".to_string()).into()),
@@ -368,6 +461,18 @@ pub fn get_ui_tree(params: &Value) -> Result<Value, Failure> {
     let Some(owner) = owner_of(target) else {
         return Err(("window_not_found".to_string(), "The window is no longer open.".to_string()).into());
     };
+    if matches!(ended, Ended::OutOfTime) {
+        truncated.push("timeout");
+    }
+    if !keep {
+        // `refs` goes out of scope here, released on the worker; nothing is kept, so no id is issued.
+        // The query walk puts in the tree only matches and their ancestors, so any element is a match.
+        let mut result = json!({ "found": !elements.is_empty() });
+        if !truncated.is_empty() {
+            result["truncated"] = json!(truncated);
+        }
+        return Ok(result);
+    }
     let tree_id = format!("t{}-{}", NEXT_TREE.fetch_add(1, Ordering::SeqCst), process_tag());
     let dropped = lock(&TREES).insert(tree_id.clone(), target, owner, refs.keep(), owner_of);
     release_on_worker(dropped.into_iter().flatten().collect());
@@ -379,9 +484,6 @@ pub fn get_ui_tree(params: &Value) -> Result<Value, Failure> {
     if let Some(index) = focused_index {
         result["focused_index"] = json!(index);
     }
-    if matches!(ended, Ended::OutOfTime) {
-        truncated.push("timeout");
-    }
     if !truncated.is_empty() {
         result["truncated"] = json!(truncated);
     }
@@ -391,6 +493,9 @@ pub fn get_ui_tree(params: &Value) -> Result<Value, Failure> {
     // Only ever `true` (the spec's protocol line): left out when the rule did not apply or was met.
     if web_content_empty {
         result["web_content_empty"] = json!(true);
+    }
+    if let Some(root) = root {
+        result["root"] = root;
     }
     Ok(result)
 }
@@ -494,6 +599,192 @@ fn worker_failure(error: WorkerError, what: Waiting) -> Failure {
     }
 }
 
+/// Reference-gaps G4: the most characters (code points) `read_text` returns, and its default.
+const READ_TEXT_MAX_CHARS: usize = 20_000;
+
+/// What `read_text` read, on the worker.
+struct TextRead {
+    text: String,
+    more: bool,
+    /// `text_pattern` or `value_pattern`.
+    source: &'static str,
+    /// For a selection: the ranges that held text.
+    ranges: Option<usize>,
+}
+
+/// `read_text`'s refusal of a password field, decided before any pattern is read. A fixed sentence:
+/// no text of the app is in it.
+fn read_password_field() -> Failure {
+    ("password_field".to_string(), "The element is a password field, so nothing was read: Deskpass never reads passwords.".to_string()).into()
+}
+
+fn read_not_supported(message: &str) -> Failure {
+    ("not_supported".to_string(), message.to_string()).into()
+}
+
+/// The app did not answer `read_text` in `TREE_BUDGET`. Nothing read so far is returned.
+fn read_timeout() -> Failure {
+    ("read_timeout".to_string(), "The app did not answer the UI Automation request for the element's text within 3 seconds, so nothing was read.".to_string()).into()
+}
+
+/// The failure of a text read the app answered with an error: a fixed sentence (the error's own
+/// text is not passed on), `element_not_found` when the element is gone.
+fn read_failure(error: &windows::core::Error) -> Failure {
+    if element_gone(error) {
+        return element_not_found();
+    }
+    ("internal".to_string(), "UI Automation could not read the element's text.".to_string()).into()
+}
+
+/// Reference-gaps G4 (ticket 07): `read_text` reads the text of element `{tree_id, index}` through
+/// UI Automation: the user's text selection (`scope` `selection`: the TextPattern only; several
+/// ranges are joined with line breaks and counted in `ranges`; none is an empty text) or all of its
+/// text (`document`, the default: the TextPattern's document range, else the ValuePattern's value).
+/// At most `max_chars` characters (code points, never cut inside a surrogate pair), starting
+/// `offset` characters in (ticket 08; for a selection, in the joined text); `more` says there was
+/// more, and an offset past the end is an empty text. A later piece reads from the start of the text
+/// and counts, not `MoveEndpointByUnit`: a provider's character unit may be a cluster rather than a
+/// code point, which would lose or repeat text between pieces, while what `GetText` returns means
+/// the same in every provider. So the cost grows with the offset, inside the same budget.
+/// It changes nothing of the user's: no input, no focus or selection change, no
+/// clipboard, no foreground (there is no `prepare_target`); it all happens on the UI Automation
+/// worker, in `TREE_BUDGET`, after which nothing partial is returned (`read_timeout`). The element's
+/// IsPassword is read first, on the worker, not taken from the tree: a password field, or one that
+/// cannot tell, is `password_field` before any pattern is touched. No error holds text of the app.
+pub fn read_text(params: &Value) -> Result<Value, Failure> {
+    let invalid = |message: &str| -> Failure { ("invalid_params".to_string(), message.to_string()).into() };
+    let selection = match params.get("scope") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(scope)) if scope == "document" => false,
+        Some(Value::String(scope)) if scope == "selection" => true,
+        Some(_) => return Err(invalid("scope must be selection or document.")),
+    };
+    let max_chars = match params.get("max_chars") {
+        None | Some(Value::Null) => READ_TEXT_MAX_CHARS,
+        Some(value) => value
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| (1..=READ_TEXT_MAX_CHARS).contains(count))
+            .ok_or_else(|| invalid("max_chars must be a whole number from 1 to 20000."))?,
+    };
+    let offset = read_text_offset(params)?;
+    let window_id = params.get("window_id").and_then(Value::as_str).unwrap_or("");
+    // The helper's own windows and unresolved apps are refused, and `expected_app` is checked.
+    let hwnd = crate::input::hwnd_from(params)?;
+    let info = windows_list::get_window(window_id)?;
+    if info["elevated"] == true && info["helper_elevated"] != true {
+        let name = info["app_name"].as_str().unwrap_or("This app");
+        return Err(("elevated_target".to_string(), format!("{name} is running as administrator and cannot be operated. Report this to the user instead of retrying.")).into());
+    }
+    let element = element_ref(params, "")?;
+    let at = Placement::now(hwnd)?;
+    if esc::stopped() {
+        return Err(interrupted());
+    }
+    let deadline = Instant::now() + TREE_BUDGET;
+    let read = match run_on_worker(deadline, move |automation| read_element_text(automation, &element, &at, selection, offset, max_chars, deadline)) {
+        Ok(read) => read,
+        Err(WorkerError::TimedOut) => Err(read_timeout()),
+        Err(WorkerError::Unavailable(_)) => Err(("internal".to_string(), "UI Automation is not available.".to_string()).into()),
+    };
+    // Text read while a stop came is not handed on.
+    if esc::stopped() {
+        return Err(interrupted());
+    }
+    let TextRead { text, more, source, ranges } = read?;
+    let mut result = json!({ "text": text, "more": more, "source": source });
+    if let Some(ranges) = ranges {
+        result["ranges"] = json!(ranges);
+    }
+    Ok(result)
+}
+
+/// `read_text`'s `offset`: absent is 0, anything but a whole number of 0 or more is refused.
+fn read_text_offset(params: &Value) -> Result<usize, Failure> {
+    let Some(value) = params.get("offset") else {
+        return Ok(0);
+    };
+    value.as_u64().and_then(|offset| usize::try_from(offset).ok()).ok_or_else(|| ("invalid_params".to_string(), "offset must be a whole number, 0 or more.".to_string()).into())
+}
+
+/// UTF-16 units to ask a range for: room for the code points up to the end of the piece and one more
+/// (so `more` is known), whatever the surrogate pairs. A cut at this length may split one pair, but
+/// only past that last code point, so neither the piece nor `more` sees it. More than a `GetText`
+/// call can ask for is -1, its "no limit".
+fn read_text_units(offset: usize, max_chars: usize) -> i32 {
+    offset.checked_add(max_chars).and_then(|last| last.checked_add(1)).and_then(|count| count.checked_mul(2)).and_then(|units| i32::try_from(units).ok()).unwrap_or(-1)
+}
+
+/// `read_text` on the worker.
+fn read_element_text(automation: &IUIAutomation, element: &ElementRef, at: &Placement, selection: bool, offset: usize, max_chars: usize, deadline: Instant) -> Result<TextRead, Failure> {
+    let units = read_text_units(offset, max_chars);
+    unsafe {
+        let Resolved { element, .. } = resolve(automation, element, at)?;
+        // Fail closed: a field whose IsPassword cannot be read is treated as a password field.
+        match element.CurrentIsPassword() {
+            Ok(password) if !password.as_bool() => {}
+            Err(error) if element_gone(&error) => return Err(element_not_found()),
+            _ => return Err(read_password_field()),
+        }
+        let text_pattern = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId);
+        if selection {
+            let pattern = text_pattern.map_err(|error| {
+                if element_gone(&error) {
+                    return element_not_found();
+                }
+                read_not_supported("This element has no text pattern, so its selection cannot be read.")
+            })?;
+            // UIA_E_NOTSUPPORTED: a text pattern whose provider has no text selection.
+            const UIA_E_NOTSUPPORTED: u32 = 0x8004_0204;
+            let ranges = pattern.GetSelection().map_err(|error| {
+                if error.code().0 as u32 == UIA_E_NOTSUPPORTED {
+                    return read_not_supported("This element does not support a text selection.");
+                }
+                read_failure(&error)
+            })?;
+            let mut parts = Vec::new();
+            for position in 0..ranges.Length().map_err(|error| read_failure(&error))? {
+                if esc::stopped() {
+                    return Err(interrupted());
+                }
+                if Instant::now() >= deadline {
+                    return Err(read_timeout());
+                }
+                let range = ranges.GetElement(position).map_err(|error| read_failure(&error))?;
+                parts.push(range.GetText(units).map_err(|error| read_failure(&error))?.to_string());
+            }
+            let JoinedText { text, more, ranges } = join_text(&parts, offset, max_chars);
+            return Ok(TextRead { text, more, source: "text_pattern", ranges: Some(ranges) });
+        }
+        match &text_pattern {
+            Ok(pattern) => match pattern.DocumentRange().and_then(|range| range.GetText(units)) {
+                Ok(text) => {
+                    let JoinedText { text, more, .. } = join_text(&[text.to_string()], offset, max_chars);
+                    return Ok(TextRead { text, more, source: "text_pattern", ranges: None });
+                }
+                Err(error) if element_gone(&error) => return Err(element_not_found()),
+                // Otherwise the value is tried, as for an element without a text pattern.
+                Err(_) => {}
+            },
+            Err(error) if element_gone(error) => return Err(element_not_found()),
+            Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(read_timeout());
+        }
+        let value: IUIAutomationValuePattern = element.GetCurrentPatternAs(UIA_ValuePatternId).map_err(|error| {
+            if element_gone(&error) {
+                return element_not_found();
+            }
+            read_not_supported("This element offers neither a text pattern nor a value, so its text cannot be read.")
+        })?;
+        let value = value.CurrentValue().map_err(|error| read_failure(&error))?;
+        // A value comes whole, so it can only be cut here.
+        let JoinedText { text, more, .. } = join_text(&[value.to_string()], offset, max_chars);
+        Ok(TextRead { text, more, source: "value_pattern", ranges: None })
+    }
+}
+
 /// Ticket 62: the screen point a `click` on `element` (`{tree_id, index}`) goes to. The element's
 /// position is read now, on the worker, not taken from when its tree was read; the point is the
 /// centre of the part of it that is visible: in the target or one of its popups (`target_popups`,
@@ -579,7 +870,11 @@ where
         Delivery::Background => unsafe { ForegroundWatch::start(hwnd, before) },
         Delivery::Foreground => None,
     };
+    // Set when the job ends, however it ends (a panic too): a watch kept past a timeout waits for it.
+    let returned = Arc::new(AtomicBool::new(false));
+    let job_returned = SetOnDrop(returned.clone());
     let done = run_on_worker(deadline, move |automation| {
+        let _returned = job_returned;
         let element = find(automation, &at)?;
         // Ticket 92: nothing is done to a password field unless the action may be (ticket 101).
         if !password_ok && unsafe { is_password(&element) } {
@@ -588,10 +883,23 @@ where
         job(automation, &element, &reached)
     });
     // Ticket 138: the foreground stays watched (and restored) until after the action returned,
-    // whatever it answered.
-    let restore = watch.map_or(Report::Unchanged, ForegroundWatch::finish);
+    // whatever it answered. An action whose call was still running at the timeout may still be
+    // taken when the app answers: its watch goes on until the call returns (`finish_when`).
+    let late = keeps_watching(matches!(done, Err(WorkerError::TimedOut)), step.now());
+    let restore = match watch {
+        Some(watch) if late => {
+            watch.finish_when(returned);
+            Report::Unchanged
+        }
+        Some(watch) => watch.finish(),
+        None => Report::Unchanged,
+    };
     let done = match done {
         Ok(done) => done?,
+        Err(_) if late => {
+            step.abandon();
+            return Err(late_action_timeout());
+        }
         Err(error) => {
             step.abandon();
             return Err(worker_failure(error, step.now()));
@@ -611,6 +919,35 @@ where
         }
     }
     Ok(result)
+}
+
+/// Whether a background action's foreground watch goes on past its request: only when the request
+/// timed out while the action's own call was running (`Waiting::Act`). Before it, the job will not
+/// act (`Step::begin_action`); after it, the action returned while it was watched.
+fn keeps_watching(timed_out: bool, waiting: Waiting) -> bool {
+    timed_out && waiting == Waiting::Act
+}
+
+/// The timeout of a background action whose call was still running (`keeps_watching`).
+fn late_action_timeout() -> Failure {
+    let seconds = ACTION_BUDGET.as_secs();
+    let watch = crate::restore::LATE_ACTION_WATCH.as_secs();
+    (
+        "input_failed".to_string(),
+        format!(
+            "The app did not respond to the UI Automation request within {seconds} seconds; it may still perform the action later. Until it does (for up to {watch} seconds), Deskpass keeps giving the foreground back if the app takes it. Take a screenshot before retrying."
+        ),
+    )
+        .into()
+}
+
+/// Sets its flag when dropped.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// An element action's job on the worker: what it has reached, for the caller's timeout message,
@@ -757,12 +1094,27 @@ pub fn click_point(params: &Value, x: i32, y: i32) -> Result<Value, Failure> {
         false,
         TREE_BUDGET,
         move |automation, at| {
-            let popups: Vec<RECT> = at.popups.iter().map(|(_, rect)| *rect).collect();
-            let point = crate::input::screen_point(at.frame, &popups, x, y)?;
-            unsafe { element_at_point(automation, at, point, Instant::now() + TREE_BUDGET) }
+            let point = screen_point_of(at, x, y)?;
+            unsafe { element_at_point(automation, at, point, Instant::now() + TREE_BUDGET, Wanted::ClickPattern) }?
+                .ok_or_else(|| background_unavailable(BackgroundReason::NoElementAtPoint))
         },
         move |_, element, step| click_through_pattern(element, step),
     )
+}
+
+/// The screen point of window pixel `(x, y)`, as a click at a point makes it (`input::screen_point`).
+fn screen_point_of(at: &Placement, x: i32, y: i32) -> Result<(i32, i32), Failure> {
+    let popups: Vec<RECT> = at.popups.iter().map(|(_, rect)| *rect).collect();
+    Ok(crate::input::screen_point(at.frame, &popups, x, y)?)
+}
+
+/// Which elements `element_at_point` takes as candidates.
+#[derive(Clone, Copy)]
+enum Wanted {
+    /// Ticket 141: one with a click pattern (`click_actions`).
+    ClickPattern,
+    /// Reference-gaps G5: any element; a scroll goes up from the deepest one to what scrolls.
+    Any,
 }
 
 /// On the worker: the click of `click_element`, through the first of the element's click patterns
@@ -784,15 +1136,340 @@ fn click_through_pattern(element: &IUIAutomationElement, step: &Step) -> Result<
     Err(background_unavailable(BackgroundReason::NoClickPattern))
 }
 
+/// The direction of a scroll (`input::scroll` has validated its name).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl ScrollDirection {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    /// Whether it is along the vertical axis.
+    fn vertical(self) -> bool {
+        matches!(self, Self::Up | Self::Down)
+    }
+
+    /// The (horizontal, vertical) amounts of one `IUIAutomationScrollPattern::Scroll` toward it:
+    /// one small increment along its axis, none along the other. Down and right are the increments
+    /// (the content moves toward its end), as the wheel's down and right are.
+    fn amounts(self) -> (ScrollAmount, ScrollAmount) {
+        match self {
+            Self::Up => (ScrollAmount_NoAmount, ScrollAmount_SmallDecrement),
+            Self::Down => (ScrollAmount_NoAmount, ScrollAmount_SmallIncrement),
+            Self::Left => (ScrollAmount_SmallDecrement, ScrollAmount_NoAmount),
+            Self::Right => (ScrollAmount_SmallIncrement, ScrollAmount_NoAmount),
+        }
+    }
+}
+
+/// Reference-gaps G5: a background scroll at window pixel `(x, y)` toward `direction` (`up`, `down`,
+/// `left` or `right`), `amount` small increments of the scrollable element there. The element is
+/// found as a background click's is (`element_at_point`: the deepest one of the target's own UI tree
+/// that contains the point, never what the screen shows there), then `scroller_from` goes up from it
+/// to the first that has a ScrollPattern that scrolls that way. Nothing scrolls there:
+/// `background_unavailable` (`no_scroll_pattern`), before anything is done. The scroll itself is
+/// `scroll_through_pattern`'s: wheel messages posted to the window under the point first, the
+/// ScrollPattern's calls when they moved nothing (the answer's `via` says which). The foreground
+/// restore, the idle wait and the result's other fields are a background click's (`act_on_found`).
+pub fn scroll_point(params: &Value, x: i32, y: i32, direction: &str, amount: u64) -> Result<Value, Failure> {
+    let hwnd = crate::input::hwnd_from(params)?;
+    let direction = ScrollDirection::parse(direction).ok_or_else(|| Failure::from(("invalid_params".to_string(), "direction must be up, down, left, or right.".to_string())))?;
+    // The screen point the finder worked out, for the job to post the wheel to (`WheelAim`).
+    let aim = Arc::new(Mutex::new(None));
+    let found_at = aim.clone();
+    let target = hwnd.0 as isize;
+    act_on_found(
+        hwnd,
+        Delivery::Background,
+        // A scroll reads and writes no text, so a password field under the point is no reason to refuse.
+        true,
+        TREE_BUDGET,
+        move |automation, at| {
+            let point = screen_point_of(at, x, y)?;
+            // A point in one of the target's popups (looked at first by `element_at_point`) is the
+            // popup's: the wheel would go to the target's window behind it, so there is none.
+            if !at.popups.iter().any(|(_, frame)| contains(frame, point)) {
+                *lock(&found_at) = Some(WheelAim { target, point });
+            }
+            unsafe { element_at_point(automation, at, point, Instant::now() + TREE_BUDGET, Wanted::Any) }?
+                .ok_or_else(|| background_unavailable(BackgroundReason::NoScrollPattern))
+        },
+        move |automation, element, step| {
+            let aim = lock(&aim).take();
+            unsafe { scroll_through_pattern(automation, element, direction, amount, aim, step) }
+        },
+    )
+}
+
+/// Where a background scroll's wheel messages go: the target's handle and the screen point (not
+/// one inside a popup of the target: `scroll_point` gives none then, and only the ScrollPattern runs).
+#[derive(Clone, Copy)]
+struct WheelAim {
+    target: isize,
+    point: (i32, i32),
+}
+
+/// The window message of one wheel notch toward `direction` and its delta: WM_MOUSEWHEEL, positive
+/// away from the user (up), or WM_MOUSEHWHEEL, positive to the right.
+fn wheel_notch(direction: ScrollDirection) -> (u32, i16) {
+    match direction {
+        ScrollDirection::Up => (WM_MOUSEWHEEL, 120),
+        ScrollDirection::Down => (WM_MOUSEWHEEL, -120),
+        ScrollDirection::Right => (WM_MOUSEHWHEEL, 120),
+        ScrollDirection::Left => (WM_MOUSEHWHEEL, -120),
+    }
+}
+
+/// The `wParam` of a wheel message: the delta in the high word, no key or button state.
+fn wheel_wparam(delta: i16) -> WPARAM {
+    WPARAM((delta as u16 as usize) << 16)
+}
+
+/// MAKELPARAM of a screen point: x in the low word and y in the high one, each a signed 16-bit
+/// value (a point left of or above the primary monitor is negative).
+fn point_lparam((x, y): (i32, i32)) -> LPARAM {
+    LPARAM((((y as i16 as u16 as u32) << 16) | (x as i16 as u16 as u32)) as isize)
+}
+
+/// The deepest window under the screen `point` among the children of `target`, which is searched
+/// from its client area down (`ChildWindowFromPointEx` finds direct children only, so it is called
+/// again for each level). Never `WindowFromPoint`: another window may cover the target there. None
+/// when the point is not in the target's client area.
+unsafe fn deepest_child_at(target: HWND, point: (i32, i32)) -> Option<HWND> {
+    let mut current = target;
+    for _ in 0..PARENT_LIMIT {
+        let mut client = POINT { x: point.0, y: point.1 };
+        if !ScreenToClient(current, &mut client).as_bool() {
+            return None;
+        }
+        let child = ChildWindowFromPointEx(current, client, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+        if child.0.is_null() {
+            return (current != target).then_some(current);
+        }
+        if child == current {
+            break;
+        }
+        current = child;
+    }
+    Some(current)
+}
+
+/// The Control View ancestors-or-self of `start`, nearest first, up to the desktop: the first with a
+/// ScrollPattern whose axis along `direction` scrolls (`CurrentVerticallyScrollable` or
+/// `CurrentHorizontallyScrollable`; being at the end of its range does not matter). None when no
+/// element on the way up is. A stop is `interrupted`; a walk not done by `deadline` `input_failed`.
+unsafe fn scroller_from(automation: &IUIAutomation, start: &IUIAutomationElement, direction: ScrollDirection, deadline: Instant) -> Result<Option<IUIAutomationScrollPattern>, Failure> {
+    let internal = |error: windows::core::Error| -> Failure { ("internal".to_string(), format!("UI Automation is not available: {error}")).into() };
+    let walker = automation.ControlViewWalker().map_err(internal)?;
+    let desktop = automation.GetRootElement().ok();
+    let mut current = start.clone();
+    for _ in 0..PARENT_LIMIT {
+        if esc::stopped() {
+            return Err(interrupted());
+        }
+        if Instant::now() >= deadline {
+            return Err((
+                "input_failed".to_string(),
+                "The app did not finish answering which element scrolls at that point in time, so nothing was scrolled. Take a screenshot before retrying.".to_string(),
+            )
+                .into());
+        }
+        if let Ok(pattern) = current.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId) {
+            let scrolls = if direction.vertical() { pattern.CurrentVerticallyScrollable() } else { pattern.CurrentHorizontallyScrollable() };
+            if scrolls.is_ok_and(|flag| flag.as_bool()) {
+                return Ok(Some(pattern));
+            }
+        }
+        let Ok(parent) = walker.GetParentElement(&current) else { return Ok(None) };
+        if desktop.as_ref().is_some_and(|desktop| automation.CompareElements(&parent, desktop).is_ok_and(|same| same.as_bool())) {
+            return Ok(None);
+        }
+        current = parent;
+    }
+    Ok(None)
+}
+
+/// The scroll position of `pattern` along `direction`'s axis, in percent (0 to 100); None when it
+/// cannot be read or the axis does not scroll (UI Automation's -1).
+unsafe fn scroll_percent(pattern: &IUIAutomationScrollPattern, direction: ScrollDirection) -> Option<f64> {
+    let percent = if direction.vertical() { pattern.CurrentVerticalScrollPercent() } else { pattern.CurrentHorizontalScrollPercent() };
+    percent.ok().filter(|percent| *percent >= 0.0)
+}
+
+/// How long before the job's deadline a scroll stops starting increments, so that its answer, rather
+/// than the timeout, reaches the caller.
+const SCROLL_MARGIN: Duration = Duration::from_millis(500);
+
+/// On the worker: the scroll of `scroll_point`. Goes up from `start` to the element that scrolls
+/// (`scroller_from`) and reads its position. When that can be read and the point's window is known
+/// (`aim`), `amount` wheel notches are posted first (`scroll_by_wheel`); if the position moved,
+/// that is the answer (`via: "wheel_message"`). Otherwise (it did not move, no window was found or
+/// the post failed; or the position cannot be read, so a wheel could not be verified) the
+/// ScrollPattern's `Scroll` is called instead (`scroll_by_pattern`, `via: "scroll_pattern"`).
+///
+/// Why the wheel comes first (ticket 138): on Notepad, Word and Edge a `Scroll` call makes the app
+/// pull itself to the foreground, 16 to 47 ms after the call, and only the restore of
+/// `act_on_found` gives it back; a posted wheel message scrolls Notepad and Word without that.
+/// Edge ignores it, which the unmoved position shows, so the ScrollPattern still serves it. At the
+/// end of its range a wheel moves nothing either, so the fallback runs and the answer still ends
+/// `moved: false`.
+///
+/// Both check a stop between steps (`begin_action` before the first, except for the ScrollPattern's
+/// after wheel notches were posted: the action has begun then) and end early when time runs
+/// out: `steps` in the answer is how many were done. The answer holds `action`, `steps`, `via` and,
+/// when the position could be read before and after, `percent_before`, `percent_after` and
+/// `moved`: a scroll at the end of its range moves nothing and still succeeds.
+unsafe fn scroll_through_pattern(automation: &IUIAutomation, start: &IUIAutomationElement, direction: ScrollDirection, amount: u64, aim: Option<WheelAim>, step: &Step) -> Result<Value, Failure> {
+    let pattern = scroller_from(automation, start, direction, step.deadline())?.ok_or_else(|| background_unavailable(BackgroundReason::NoScrollPattern))?;
+    let before = scroll_percent(&pattern, direction);
+    let mut posted = 0;
+    if let (Some(before), Some(aim)) = (before, aim) {
+        let (done, notches) = scroll_by_wheel(&pattern, direction, amount, aim, before, step)?;
+        if let Some(done) = done {
+            return Ok(done);
+        }
+        posted = notches;
+    }
+    scroll_by_pattern(&pattern, direction, amount, before, posted > 0, step)
+}
+
+/// How long the position must have held still for a wheel scroll to be taken as finished; how long
+/// it is waited for at least, and how much longer for each notch posted; the most that comes to.
+/// A posted message is handled when the app gets to it, an animated scroll (a list box's, Word's)
+/// takes a while with pauses in it, and reading the position of a busy app takes 100 to 300 ms, so
+/// the wait is generous: a scroll judged unmoved is done again through the ScrollPattern, and a
+/// wheel that was only late would then scroll twice.
+const WHEEL_STILL: Duration = Duration::from_millis(250);
+const WHEEL_WAIT: Duration = Duration::from_millis(700);
+const WHEEL_WAIT_PER_NOTCH: Duration = Duration::from_millis(40);
+const WHEEL_WAIT_CAP: Duration = Duration::from_millis(1500);
+
+/// On the worker: posts `amount` wheel notches toward `direction` to the deepest window under
+/// `aim` (`deepest_child_at`): no cursor move, no SendInput, no activation. Then waits for the
+/// position as a read-back does (`settle`), until it moved from `before` and has held still for
+/// `WHEEL_STILL` (the app handles posted messages later, and a long scroll is one it is still working
+/// through). The answer when it moved, with `via: "wheel_message"`; None when it did not, the
+/// window was not found or the first post failed. Besides, how many notches were posted, which the
+/// fallback needs: after any, the action has begun (`scroll_by_pattern`).
+unsafe fn scroll_by_wheel(pattern: &IUIAutomationScrollPattern, direction: ScrollDirection, amount: u64, aim: WheelAim, before: f64, step: &Step) -> Result<(Option<Value>, u64), Failure> {
+    let Some(window) = deepest_child_at(HWND(aim.target as *mut core::ffi::c_void), aim.point) else { return Ok((None, 0)) };
+    let (message, delta) = wheel_notch(direction);
+    let (wparam, lparam) = (wheel_wparam(delta), point_lparam(aim.point));
+    let mut steps = 0u64;
+    while steps < amount {
+        if steps == 0 {
+            step.begin_action()?;
+        } else {
+            if esc::stopped() {
+                return Err(stopped_after_action());
+            }
+            if Instant::now() + SCROLL_MARGIN >= step.deadline() {
+                break;
+            }
+        }
+        if PostMessageW(Some(window), message, wparam, lparam).is_err() {
+            if steps == 0 {
+                return Ok((None, 0));
+            }
+            break;
+        }
+        steps += 1;
+    }
+    step.reached(Waiting::ReadBack);
+    let read = || scroll_percent(pattern, direction);
+    // Posted messages are handled when the app gets to them, and many apps animate a scroll, so
+    // the position is read until it moved and has held still for `WHEEL_STILL`; the longer the
+    // scroll, the longer the wait.
+    let held = Cell::new((f64::NAN, Instant::now()));
+    let stopped_moving = |after: &f64| {
+        let (position, since) = held.get();
+        let since = if position.is_nan() || scrolled(position, *after) { Instant::now() } else { since };
+        held.set((*after, since));
+        scrolled(before, *after) && since.elapsed() >= WHEEL_STILL
+    };
+    let wait = (WHEEL_WAIT + WHEEL_WAIT_PER_NOTCH * steps.min(100) as u32).min(WHEEL_WAIT_CAP);
+    let after = settle(read, stopped_moving, wait, READ_BACK_INTERVAL, READ_BACK_MARGIN, step.deadline()).map_err(|Stopped| stopped_after_action())?;
+    Ok((after.filter(|after| scrolled(before, *after)).map(|after| scroll_answer(steps, "wheel_message", Some(before), Some(after))), steps))
+}
+
+/// On the worker: calls the ScrollPattern's `Scroll` `amount` times, each one small increment
+/// toward `direction`, then reads the position again, waiting a little for an app that moves after
+/// its call returned, as a read-back does. `after_wheel`: wheel notches were posted before, so the
+/// action has begun (`begin_action` would say that nothing was sent) and the first call is checked
+/// as the later ones are, for a stop and the time left.
+unsafe fn scroll_by_pattern(pattern: &IUIAutomationScrollPattern, direction: ScrollDirection, amount: u64, before: Option<f64>, after_wheel: bool, step: &Step) -> Result<Value, Failure> {
+    let (horizontal, vertical) = direction.amounts();
+    let mut steps = 0u64;
+    while steps < amount {
+        if steps == 0 && !after_wheel {
+            step.begin_action()?;
+        } else {
+            if esc::stopped() {
+                return Err(stopped_after_action());
+            }
+            if Instant::now() + SCROLL_MARGIN >= step.deadline() {
+                break;
+            }
+            if steps == 0 {
+                // After the wheel the step was left at the read-back; the Scroll calls are the
+                // action again, so a timeout keeps the foreground watch and says it may still act.
+                step.reached(Waiting::Act);
+            }
+        }
+        if let Err(error) = pattern.Scroll(horizontal, vertical) {
+            if steps == 0 {
+                return Err(action_failure(&error, "scroll"));
+            }
+            break;
+        }
+        steps += 1;
+    }
+    step.reached(Waiting::ReadBack);
+    let read = || scroll_percent(pattern, direction);
+    let after = settle(read, |after| before.is_none_or(|before| scrolled(before, *after)), READ_BACK_WAIT, READ_BACK_INTERVAL, READ_BACK_MARGIN, step.deadline())
+        .map_err(|Stopped| stopped_after_action())?;
+    Ok(scroll_answer(steps, "scroll_pattern", before, after))
+}
+
+/// The answer of a background scroll: `action`, `steps`, `via` and, when the position could be read
+/// before and after, `percent_before`, `percent_after` and `moved`.
+fn scroll_answer(steps: u64, via: &str, before: Option<f64>, after: Option<f64>) -> Value {
+    let mut done = json!({ "action": "scroll", "steps": steps, "via": via });
+    if let (Some(before), Some(after)) = (before, after) {
+        done["percent_before"] = json!(before);
+        done["percent_after"] = json!(after);
+        done["moved"] = json!(scrolled(before, after));
+    }
+    done
+}
+
+/// Whether two scroll positions (percent) differ by more than the rounding of a provider.
+fn scrolled(before: f64, after: f64) -> bool {
+    (after - before).abs() > 0.001
+}
+
 /// On the worker (ticket 141): the deepest element of the Control View below the target, or of one
 /// of its popups (looked at first: they lie above it), that is on screen, contains the screen
 /// `point` and has a click pattern (`click_actions`); of equal depth the first. Only elements that
 /// contain the point are followed down, so an element is chosen only when every ancestor contains
 /// it too (a scrolled-out part of a list is not hit through its clipped parent). One call into the
 /// app for each element followed (`tree_request`, as a tree read does). Nothing found is
-/// `background_unavailable` (`no_element_at_point`); a stop is `interrupted`, and a search not
-/// finished by `deadline` `input_failed`: what is deeper there is not known, so none is picked.
-unsafe fn element_at_point(automation: &IUIAutomation, at: &Placement, point: (i32, i32), deadline: Instant) -> Result<IUIAutomationElement, Failure> {
+/// `background_unavailable` (`no_element_at_point`, said by the caller: None here); a stop is
+/// `interrupted`, and a search not finished by `deadline` `input_failed`: what is deeper there is
+/// not known, so none is picked. `wanted` says which elements are candidates (above: `ClickPattern`).
+unsafe fn element_at_point(automation: &IUIAutomation, at: &Placement, point: (i32, i32), deadline: Instant, wanted: Wanted) -> Result<Option<IUIAutomationElement>, Failure> {
     let internal = |error: windows::core::Error| -> Failure { ("internal".to_string(), format!("UI Automation is not available: {error}")).into() };
     let children = tree_request(automation, TreeScope_Children).map_err(internal)?;
     let itself = tree_request(automation, TreeScope_Element).map_err(internal)?;
@@ -812,15 +1489,15 @@ unsafe fn element_at_point(automation: &IUIAutomation, at: &Placement, point: (i
     for (root, is_popup) in roots {
         let mut best = None;
         if is_popup {
-            consider(&root, 0, point, &mut best);
+            consider(&root, 0, point, wanted, &mut best);
         }
-        search_below(&UiaNode { element: root, children: &children }, 1, point, deadline, &mut best)?;
+        search_below(&UiaNode { element: root, children: &children }, 1, point, deadline, wanted, &mut best)?;
         found = best.map(|(_, element)| element);
         if found.is_some() {
             break;
         }
     }
-    found.ok_or_else(|| background_unavailable(BackgroundReason::NoElementAtPoint))
+    Ok(found)
 }
 
 /// Whether the screen `point` is in `rect`.
@@ -831,7 +1508,7 @@ fn contains(rect: &RECT, point: (i32, i32)) -> bool {
 /// `element` as a candidate of `element_at_point` at `depth`: it is when it is on screen, contains
 /// `point` and has a click pattern, and no candidate of the same or less depth is held in `best`.
 /// Answers whether it contains the point (and is on screen), that is, whether to look below it.
-unsafe fn consider(element: &IUIAutomationElement, depth: usize, point: (i32, i32), best: &mut Option<(usize, IUIAutomationElement)>) -> bool {
+unsafe fn consider(element: &IUIAutomationElement, depth: usize, point: (i32, i32), wanted: Wanted, best: &mut Option<(usize, IUIAutomationElement)>) -> bool {
     let cached = Cached::of(element);
     if cached.offscreen || !cached.rect.is_some_and(|rect| contains(&rect, point)) {
         return false;
@@ -844,7 +1521,11 @@ unsafe fn consider(element: &IUIAutomationElement, depth: usize, point: (i32, i3
         scroll_item: cached.scroll_item,
         focusable: cached.focusable,
     };
-    if !click_actions(&abilities).is_empty() && best.as_ref().is_none_or(|(held, _)| depth > *held) {
+    let candidate = match wanted {
+        Wanted::ClickPattern => !click_actions(&abilities).is_empty(),
+        Wanted::Any => true,
+    };
+    if candidate && best.as_ref().is_none_or(|(held, _)| depth > *held) {
         *best = Some((depth, element.clone()));
     }
     true
@@ -853,7 +1534,7 @@ unsafe fn consider(element: &IUIAutomationElement, depth: usize, point: (i32, i3
 /// `element_at_point` below `parent`: each child that contains the point is considered, and its
 /// own children searched in turn. Asked before each fetch of children whether the user stopped or
 /// the time is up.
-unsafe fn search_below(parent: &UiaNode, depth: usize, point: (i32, i32), deadline: Instant, best: &mut Option<(usize, IUIAutomationElement)>) -> Result<(), Failure> {
+unsafe fn search_below(parent: &UiaNode, depth: usize, point: (i32, i32), deadline: Instant, wanted: Wanted, best: &mut Option<(usize, IUIAutomationElement)>) -> Result<(), Failure> {
     if esc::stopped() {
         return Err(interrupted());
     }
@@ -872,8 +1553,8 @@ unsafe fn search_below(parent: &UiaNode, depth: usize, point: (i32, i32), deadli
             .into());
     }
     for child in parent.children() {
-        if consider(&child.element, depth, point, best) {
-            search_below(&child, depth + 1, point, deadline, best)?;
+        if consider(&child.element, depth, point, wanted, best) {
+            search_below(&child, depth + 1, point, deadline, wanted, best)?;
         }
     }
     Ok(())
@@ -1550,7 +2231,8 @@ enum Seen {
     /// Not shown itself (an unnamed container); its children take its place one level up.
     Hidden,
     /// `matched`: its name or value holds a query's text (ticket 63; false without a query).
-    Shown { line: Value, actionable: bool, focused: bool, matched: bool },
+    /// `interactive`: it can do more than be scrolled into view (`interactive_only` keeps these).
+    Shown { line: Value, actionable: bool, interactive: bool, focused: bool, matched: bool },
 }
 
 impl<N: Node> Root<N> {
@@ -1576,13 +2258,14 @@ struct Level<N> {
 }
 
 /// Depth-first over each root in turn, in order, within the limits: `CHILD_LIMIT` children per
-/// parent (the rest counted as omitted on the nearest shown ancestor), `DEPTH_LIMIT` levels of
-/// the shown tree (children below counted as omitted, `truncated: depth`), and `NODE_LIMIT`
-/// lines (`truncated: nodes`). `cut_short` is asked before each element, so between any two
-/// fetches of children (`Node::children`); the children past `CHILD_LIMIT` are counted from their
-/// parent's fetch, not visited.
+/// parent (the rest counted as omitted on the nearest shown ancestor), `max_depth` levels of
+/// the shown tree (`DEPTH_LIMIT` without one; children below counted as omitted, `truncated:
+/// depth`), and `NODE_LIMIT` lines (`truncated: nodes`). `cut_short` is asked before each element,
+/// so between any two fetches of children (`Node::children`); the children past `CHILD_LIMIT` are
+/// counted from their parent's fetch, not visited.
 fn walk_tree<N: Node, E>(
     roots: Vec<Root<N>>,
+    max_depth: Option<usize>,
     mut describe: impl FnMut(&N, usize) -> Seen,
     keep: impl Fn(&N) -> E,
     walked: &Mutex<Walked<E>>,
@@ -1602,6 +2285,7 @@ fn walk_tree<N: Node, E>(
             None => walked.omitted_children += omitted,
         }
     };
+    let depth_limit = max_depth.unwrap_or(DEPTH_LIMIT);
     for root in roots {
         let mut path = vec![Level { next: root.start(), visited: 0, depth: 0, shown: None }];
         while let Some(level) = path.last_mut() {
@@ -1642,7 +2326,7 @@ fn walk_tree<N: Node, E>(
                 }
             };
             let children = element.children();
-            if child_depth >= DEPTH_LIMIT {
+            if child_depth >= depth_limit {
                 if !children.is_empty() {
                     omit(shown, children.len());
                     let mut walked = lock(walked);
@@ -1686,19 +2370,23 @@ struct Branch<N> {
 }
 
 /// Ticket 63: the walk for a query, over each root in turn like `walk_tree`. It visits every
-/// child of a parent, within `DEPTH_LIMIT` (`truncated: depth`) and the time `cut_short` allows,
-/// and puts in the tree only the elements `describe` says matched and their shown ancestors, as
-/// soon as it reaches them, so a walk cut short keeps what it found. The limits on what is shown
-/// apply to that: `CHILD_LIMIT` matches per parent (the rest counted as omitted there; an
-/// ancestor of a match takes no place), and `NODE_LIMIT` lines, where the walk stops
-/// (`truncated: nodes`).
+/// child of a parent, within `max_depth` levels (`DEPTH_LIMIT` without one; `truncated: depth`)
+/// and the time `cut_short` allows, and puts in the tree only the elements `describe` says
+/// matched and their shown ancestors, as soon as it reaches them, so a walk cut short keeps what
+/// it found. The limits on what is shown apply to that: `CHILD_LIMIT` matches per parent (the rest
+/// counted as omitted there; an ancestor of a match takes no place), and `NODE_LIMIT` lines, where
+/// the walk stops (`truncated: nodes`). Reference-gaps G3: with a `max_depth`, a matching element
+/// at the last level that has children below counts them as omitted on its line, as `walk_tree`
+/// does; without one the cut is silent in the tree, as it always was.
 fn walk_matching<N: Node, E>(
     roots: Vec<Root<N>>,
+    max_depth: Option<usize>,
     mut describe: impl FnMut(&N, usize) -> Seen,
     keep: impl Fn(&N) -> E,
     walked: &Mutex<Walked<E>>,
     cut_short: impl Fn() -> Option<Ended>,
 ) -> Ended {
+    let depth_limit = max_depth.unwrap_or(DEPTH_LIMIT);
     for root in roots {
         let mut chain: Vec<Pending<E>> = Vec::new();
         // Matches at the top of this root, against `CHILD_LIMIT`.
@@ -1721,7 +2409,7 @@ fn walk_matching<N: Node, E>(
                     path.push(Branch { next: element.children().into_iter(), depth, owned: false });
                     continue;
                 }
-                Seen::Shown { line, actionable, focused, matched } => (line, actionable, focused, matched),
+                Seen::Shown { line, actionable, focused, matched, .. } => (line, actionable, focused, matched),
             };
             let parent = chain.len().checked_sub(1);
             chain.push(Pending { line, keep: actionable.then(|| keep(&element)), focused, at: None, matches: 0, omitted: 0, omitted_there: false });
@@ -1753,11 +2441,19 @@ fn walk_matching<N: Node, E>(
                 }
             }
             let children = element.children();
-            if depth + 1 >= DEPTH_LIMIT {
+            if depth + 1 >= depth_limit {
                 if !children.is_empty() {
                     let mut walked = lock(walked);
                     if !walked.truncated.contains(&"depth") {
                         walked.truncated.push("depth");
+                    }
+                    // Only an element in the tree has a line to count on; one that is not has nothing
+                    // shown below it either.
+                    if max_depth.is_some() {
+                        if let Some(me) = chain.last_mut().filter(|me| me.at.is_some()) {
+                            me.omitted += children.len();
+                            show_omitted(&mut walked, me);
+                        }
                     }
                 }
                 // Popped at once, with this element.
@@ -1904,8 +2600,19 @@ unsafe fn read_value(element: &IUIAutomationElement) -> Option<String> {
 /// The Control View below the window, then each of the window's own `popups` (handle and visible
 /// frame) that is not already part of the window's tree (a dropdown list UI Automation puts under
 /// its combo box). An element entirely outside the window and those popups is skipped. With a
-/// `query` (folded) only its matches and their ancestors are kept (`walk_matching`).
-fn walk(automation: &IUIAutomation, scope: &Scope, query: Option<&str>, walked: &Mutex<Walked<Element>>, deadline: Instant) -> Ended {
+/// `query` (folded) only its matches and their ancestors are kept (`walk_matching`). Reference-gaps
+/// G3: with a `subtree` (the root element, and where the window is now) the walk is the root and what
+/// is below it, and the popups are not walked (`walk_roots`); what it shows is still limited to the
+/// window's and its popups' areas.
+fn walk(
+    automation: &IUIAutomation,
+    scope: &Scope,
+    query: Option<&str>,
+    shape: Shape,
+    subtree: Option<&(ElementRef, Placement)>,
+    walked: &Mutex<Walked<Element>>,
+    deadline: Instant,
+) -> Ended {
     let Scope { target, frame, popups, chromium, title } = scope;
     let (target, frame) = (*target, *frame);
     let hwnd = HWND(target as *mut core::ffi::c_void);
@@ -1918,14 +2625,34 @@ fn walk(automation: &IUIAutomation, scope: &Scope, query: Option<&str>, walked: 
         Ok(found) => found,
         Err(error) => return Ended::Failed(error.to_string()),
     };
+    // Reference-gaps G3 (ticket 06): the root of a subtree is found again as an element action finds
+    // its element (`resolve`: a stale one is `element_not_found`) and described afresh, as a popup
+    // is. A subtree is not a read of the window's web content, so that is left alone below.
+    let subtree = match subtree {
+        None => None,
+        Some((element, at)) => match unsafe { resolve(automation, element, at) }.and_then(|resolved| unsafe { resolved.element.BuildUpdatedCache(&itself) }.map_err(|_| element_not_found())) {
+            Ok(element) => {
+                let cached = unsafe { Cached::of(&element) };
+                let mut described = json!({ "role": cached.control.map_or("element", role_name) });
+                let (name, _) = cut_text(cached.name, NAME_CHARS);
+                if !name.is_empty() {
+                    described["name"] = json!(name);
+                }
+                lock(walked).root = Some(described);
+                Some(UiaNode { element, children: &children })
+            }
+            Err(failure) => return Ended::Rejected(failure),
+        },
+    };
+    let chromium = *chromium && subtree.is_none();
     // Ticket 66: the first query is what makes a Chromium app build its web content's tree, so give
     // it the wait before the walk; the walk then reads what is there.
     // Ticket 71: a window found empty by an earlier read (same title) does not wait again; whether
     // it is still empty is read from the Documents the walk passes (`main_documents`).
-    let found_empty = *chromium && lock(&EMPTY_WAITS).knows(target, title);
+    let found_empty = chromium && lock(&EMPTY_WAITS).knows(target, title);
     if found_empty {
         lock(walked).web_content_empty = true;
-    } else if *chromium {
+    } else if chromium {
         // A search that has not finished by then answers "empty", so it keeps off the walk's time as the wait does.
         let until = deadline.checked_sub(WEB_MARGIN).unwrap_or_else(Instant::now);
         let known = RefCell::new(Vec::new());
@@ -1941,21 +2668,34 @@ fn walk(automation: &IUIAutomation, scope: &Scope, query: Option<&str>, walked: 
             Err(Stopped) => return Ended::Stopped,
         }
     }
-    // Only kept for a window found empty before: its Documents' areas and elements.
+    // Whether the web content is still to be looked at after the walk: a window found empty before,
+    // or one the wait above found empty now. Chromium may build the content while the walk runs
+    // (measured in a fresh Edge: the first read walked 50 page elements after a wait that ended
+    // empty), so the walk's Documents decide it then, as for a window found empty before.
+    let empty_before_walk = found_empty || lock(walked).web_content_empty;
+    // Only kept when `empty_before_walk`: the Documents' areas and elements.
     let main_documents = RefCell::new(Vec::new());
     let mut area = vec![frame];
     area.extend(popups.iter().map(|(_, rect)| *rect));
-    let mut roots = vec![Root::ChildrenOf(UiaNode { element: root.clone(), children: &children })];
-    for (popup, _) in popups {
-        if esc::stopped() {
-            return Ended::Stopped;
+    let window = UiaNode { element: root.clone(), children: &children };
+    let roots = walk_roots(window, subtree, || {
+        let mut found = Vec::new();
+        for (popup, _) in popups {
+            if esc::stopped() {
+                return Err(Ended::Stopped);
+            }
+            // The popup is described itself, so it comes with its properties.
+            let Ok(element) = (unsafe { automation.ElementFromHandleBuildCache(HWND(*popup as *mut core::ffi::c_void), &itself) }) else { continue };
+            if !unsafe { below(automation, &walker, &element, &root) } {
+                found.push(UiaNode { element, children: &children });
+            }
         }
-        // The popup is described itself, so it comes with its properties.
-        let Ok(element) = (unsafe { automation.ElementFromHandleBuildCache(HWND(*popup as *mut core::ffi::c_void), &itself) }) else { continue };
-        if !unsafe { below(automation, &walker, &element, &root) } {
-            roots.push(Root::Itself(UiaNode { element, children: &children }));
-        }
-    }
+        Ok(found)
+    });
+    let roots = match roots {
+        Ok(roots) => roots,
+        Err(ended) => return ended,
+    };
     let cut_short = || {
         if esc::stopped() {
             Some(Ended::Stopped)
@@ -1967,19 +2707,30 @@ fn walk(automation: &IUIAutomation, scope: &Scope, query: Option<&str>, walked: 
     };
     let seen = |node: &UiaNode, depth| unsafe {
         let cached = Cached::of(&node.element);
-        if found_empty && cached.control == Some(UIA_DocumentControlTypeId) {
+        if empty_before_walk && cached.control == Some(UIA_DocumentControlTypeId) {
             main_documents.borrow_mut().push((area_of(cached.rect), node.element.clone()));
         }
         describe(&cached, || read_value(&node.element), depth, frame, &area, query)
     };
     let keep = |node: &UiaNode| Element(node.element.clone());
-    let ended = match query {
-        Some(_) => walk_matching(roots, seen, keep, walked, cut_short),
-        None => walk_tree(roots, seen, keep, walked, cut_short),
+    let ended = match (query, shape.interactive_only) {
+        (None, false) => walk_tree(roots, shape.max_depth, seen, keep, walked, cut_short),
+        // Reference-gaps G3: the numbered elements are the matches (of the query, with one).
+        (query, interactive_only) => {
+            let seen = |node: &UiaNode, depth| {
+                let seen = seen(node, depth);
+                if interactive_only {
+                    only_interactive(seen, query.is_some())
+                } else {
+                    seen
+                }
+            };
+            walk_matching(roots, shape.max_depth, seen, keep, walked, cut_short)
+        }
     };
-    // The web content of a window found empty before: ready now if the largest Document the walk
-    // met has children. A walk that ended early has met what it met; the answer stays "empty" then.
-    if found_empty && !matches!(ended, Ended::Stopped) && Instant::now() < deadline {
+    // The web content found empty before the walk: ready now if the largest Document the walk met
+    // has children. A walk that ended early has met what it met; the answer stays "empty" then.
+    if empty_before_walk && !matches!(ended, Ended::Stopped) && Instant::now() < deadline {
         let documents: Vec<(i64, bool)> = main_documents
             .borrow()
             .iter()
@@ -2107,6 +2858,27 @@ fn cut_text(text: String, limit: usize) -> (String, Option<usize>) {
     (text.chars().take(limit).collect(), Some(length))
 }
 
+/// Reference-gaps G4: the text `read_text` returns from the text of each range (a document is one),
+/// and how many ranges had any.
+#[derive(Debug, PartialEq)]
+struct JoinedText {
+    text: String,
+    /// There are more characters (code points) after this piece.
+    more: bool,
+    /// Ranges that held text, whether or not this piece shows any of it.
+    ranges: usize,
+}
+
+/// The non-empty `parts` joined with a line break, then the piece of at most `max_chars` characters
+/// (code points, so never inside a surrogate pair) that starts `offset` characters in.
+fn join_text(parts: &[String], offset: usize, max_chars: usize) -> JoinedText {
+    let present: Vec<&str> = parts.iter().map(String::as_str).filter(|part| !part.is_empty()).collect();
+    let joined = present.join("\n");
+    let mut rest = joined.chars().skip(offset);
+    let text = rest.by_ref().take(max_chars).collect();
+    JoinedText { text, more: rest.next().is_some(), ranges: present.len() }
+}
+
 fn overlaps(a: &RECT, b: &RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
@@ -2193,12 +2965,15 @@ fn describe(element: &Cached, read_value: impl FnOnce() -> Option<String>, depth
     let read_only = element.value_read_only;
     let settable = read_only == Some(false);
     let Cached { invoke, toggle, expand: expand_state, selected, scroll_item, enabled, focused, focusable, .. } = *element;
-    let actionable = INTERACTIVE.contains(&control.0) || invoke || toggle.is_some() || settable || expand_state.is_some() || selected.is_some() || scroll_item;
+    // Numbered: any ability. Interactive (what `interactive_only` keeps): any but scroll_into_view,
+    // which Chromium gives almost every element.
+    let interactive = INTERACTIVE.contains(&control.0) || invoke || toggle.is_some() || settable || expand_state.is_some() || selected.is_some() || focusable;
+    let actionable = interactive || scroll_item;
     if !actionable {
         if name.is_empty() {
             return Seen::Hidden;
         }
-        return Seen::Shown { line: json!({ "depth": depth, "role": role, "name": name, "states": [], "actions": [] }), actionable: false, focused: false, matched };
+        return Seen::Shown { line: json!({ "depth": depth, "role": role, "name": name, "states": [], "actions": [] }), actionable: false, interactive: false, focused: false, matched };
     }
     // Only a value can give a password away, so it is judged where there is one. Fail closed: an
     // element whose IsPassword could not be read is treated as a password box. IsPassword is in the
@@ -2268,7 +3043,18 @@ fn describe(element: &Cached, read_value: impl FnOnce() -> Option<String>, depth
             }
         }
     }
-    Seen::Shown { line, actionable: true, focused, matched }
+    Seen::Shown { line, actionable: true, interactive, focused, matched }
+}
+
+/// Reference-gaps G3 (`interactive_only`): only an `interactive` element counts as a match (a
+/// numbered one that can do more than be scrolled into view; followups 03), so the walk puts in the
+/// tree these and their ancestors, and a label with nothing interactive below it stays out. With a
+/// query (`searching`) it must match too; without one every interactive element does.
+fn only_interactive(seen: Seen, searching: bool) -> Seen {
+    match seen {
+        Seen::Shown { line, actionable, interactive, focused, matched } => Seen::Shown { line, actionable, interactive, focused, matched: interactive && (matched || !searching) },
+        other => other,
+    }
 }
 
 /// A query's text as it is compared (ticket 63): lowercased, which also folds non-ASCII letters
@@ -2419,7 +3205,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{aim, cut_text, walk_matching, walk_tree, Ended, Missed, Node, Root, Seen, TreeCache, Walked};
+    use super::{aim, cut_text, only_interactive, root_ref, walk_matching, walk_roots, walk_tree, Ended, Missed, Node, Root, Seen, Shape, TreeCache, Walked};
 
     /// A tree for the walk tests: each node has a label and children. A label `skip…` is a node
     /// the walk skips with its subtree (offscreen, empty, outside the window), an empty label an
@@ -2462,9 +3248,11 @@ mod tests {
         if label.is_empty() {
             return Seen::Hidden;
         }
-        let actionable = label.starts_with('b');
-        let role = if actionable { "button" } else { "text" };
-        Seen::Shown { line: json!({ "depth": depth, "role": role, "name": label, "states": [], "actions": [] }), actionable, focused: label.ends_with("focused"), matched: label.contains("hit") }
+        let button = label.starts_with('b');
+        // `scroll…`: numbered, but nothing beyond scroll_into_view (Chromium gives most elements that).
+        let scroll_only = label.starts_with("scroll");
+        let (role, actions) = if button { ("button", json!([])) } else if scroll_only { ("pane", json!(["click", "scroll_into_view"])) } else { ("text", json!([])) };
+        Seen::Shown { line: json!({ "depth": depth, "role": role, "name": label, "states": [], "actions": actions }), actionable: button || scroll_only, interactive: button, focused: label.ends_with("focused"), matched: label.contains("hit") }
     }
 
     /// A query walk (ticket 63) where a label holding `hit` matches, with `cut_short` asked
@@ -2474,7 +3262,7 @@ mod tests {
         let mut roots = vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))];
         roots.extend(popups.iter().map(|&id| Root::Itself(Fake(Rc::clone(&arena), id))));
         let walked = Mutex::new(Walked::default());
-        let ended = walk_matching(roots, seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, cut_short);
+        let ended = walk_matching(roots, None, seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, cut_short);
         (ended, walked.into_inner().unwrap())
     }
 
@@ -2616,12 +3404,389 @@ mod tests {
         assert!(!holds("檔案", &fold("下載")));
     }
 
+    /// Reference-gaps G3: a walk the way `walk` runs one for `shape`, `searching` meaning a query
+    /// (a label holding `hit` matches). The window's tree is read; no popups.
+    fn run_shaped(arena: Arena, shape: Shape, searching: bool) -> (Ended, Walked<String>) {
+        let arena = Rc::new(arena);
+        let roots = vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))];
+        let walked = Mutex::new(Walked::default());
+        let keep = |node: &Fake| node.0.labels[node.1].clone();
+        let describe = |node: &Fake, depth| if shape.interactive_only { only_interactive(seen(node, depth), searching) } else { seen(node, depth) };
+        let ended = if !searching && !shape.interactive_only {
+            walk_tree(roots, shape.max_depth, describe, keep, &walked, || None)
+        } else {
+            walk_matching(roots, shape.max_depth, describe, keep, &walked, || None)
+        };
+        (ended, walked.into_inner().unwrap())
+    }
+
+    fn depth(levels: usize) -> Shape {
+        Shape { max_depth: Some(levels), interactive_only: false }
+    }
+
+    const INTERACTIVE: Shape = Shape { max_depth: None, interactive_only: true };
+
+    /// Reference-gaps G3: `max_depth` counts levels of the shown tree from the top; what is below
+    /// the last one is counted on its parent as omitted, and the cut is `truncated: depth`. An
+    /// unnamed container takes no level, and a tree that fits is not cut.
+    #[test]
+    fn max_depth_stops_the_walk_at_that_many_levels_and_counts_what_is_below() {
+        let build = || {
+            let mut arena = Arena::new();
+            let first = arena.add(0, "A");
+            let second = arena.add(first, "B");
+            let hidden = arena.add(second, "");
+            arena.add(hidden, "C");
+            arena.add(first, "B2");
+            arena.add(0, "A2");
+            arena
+        };
+        let (_, walked) = run_shaped(build(), depth(2), false);
+        assert_eq!(
+            outline(&walked),
+            [line(0, "A", None, None), line(1, "B", None, Some(1)), line(1, "B2", None, None), line(0, "A2", None, None)]
+        );
+        assert_eq!(walked.truncated, ["depth"]);
+        let (_, walked) = run_shaped(build(), depth(1), false);
+        assert_eq!(outline(&walked), [line(0, "A", None, Some(2)), line(0, "A2", None, None)]);
+        assert_eq!(walked.truncated, ["depth"]);
+        // The unnamed container is no level: C is the third.
+        let (_, walked) = run_shaped(build(), depth(3), false);
+        assert_eq!(walked.elements.len(), 5);
+        assert!(walked.truncated.is_empty(), "{:?}", walked.truncated);
+    }
+
+    /// Reference-gaps G3: with a query, `max_depth` also counts the children it leaves out below a
+    /// matching element; without one the query walk's cut stays silent in the tree as it was.
+    #[test]
+    fn max_depth_with_a_query_counts_what_is_below_a_match() {
+        let build = || {
+            let mut arena = Arena::new();
+            let top = arena.add(0, "Top");
+            let hit = arena.add(top, "hit holder");
+            arena.add(hit, "below 1");
+            arena.add(hit, "below 2");
+            let plain = arena.add(top, "plain");
+            arena.add(plain, "hit deeper");
+            arena
+        };
+        let (_, walked) = run_shaped(build(), depth(2), true);
+        assert_eq!(outline(&walked), [line(0, "Top", None, None), line(1, "hit holder", None, Some(2))]);
+        assert_eq!(walked.truncated, ["depth"]);
+        // Nothing of "plain" is shown or counted: nothing under it was searched.
+        let (_, walked) = run_shaped(build(), Shape::default(), true);
+        assert_eq!(walked.elements.len(), 4);
+        assert!(walked.elements.iter().all(|line| line.get("omitted_children").is_none()));
+    }
+
+    /// Reference-gaps G3: `interactive_only` keeps the numbered elements and their ancestors, in
+    /// walk order and numbered as usual; labels with nothing numbered below them are left out, and
+    /// unnamed containers still lift their children.
+    #[test]
+    fn interactive_only_keeps_numbered_elements_and_their_ancestors() {
+        let mut arena = Arena::new();
+        arena.add(0, "label alone");
+        let group = arena.add(0, "Group");
+        arena.add(group, "text under group");
+        let one = arena.add(group, "b-one");
+        arena.add(one, "text under button");
+        let pane = arena.add(0, "Pane");
+        let deep = arena.add(pane, "Deep");
+        arena.add(deep, "b-deep focused");
+        let container = arena.add(0, "");
+        arena.add(container, "b-lifted");
+        let skipped = arena.add(0, "skip offscreen");
+        arena.add(skipped, "b-never");
+        let (ended, walked) = run_shaped(arena, INTERACTIVE, false);
+        assert!(matches!(ended, Ended::Whole));
+        assert_eq!(
+            outline(&walked),
+            [
+                line(0, "Group", None, None),
+                line(1, "b-one", Some(1), None),
+                line(0, "Pane", None, None),
+                line(1, "Deep", None, None),
+                line(2, "b-deep focused", Some(2), None),
+                line(0, "b-lifted", Some(3), None),
+            ]
+        );
+        assert_eq!(walked.refs, ["b-one", "b-deep focused", "b-lifted"]);
+        assert_eq!(walked.focused_index, Some(2));
+        assert!(walked.truncated.is_empty(), "{:?}", walked.truncated);
+    }
+
+    /// Followups 03: Chromium gives almost every element a ScrollItem pattern, so most of a page is
+    /// numbered; an element that can only be scrolled into view is no reason for `interactive_only`
+    /// to keep it. The plain walk still numbers it (numbers and click-by-number are unchanged), and
+    /// `interactive_only` shows it only as the ancestor of an element that can do more.
+    #[test]
+    fn interactive_only_leaves_out_elements_that_can_only_be_scrolled_into_view() {
+        let build = || {
+            let mut arena = Arena::new();
+            arena.add(0, "scroll-alone");
+            arena.add(0, "b-one");
+            let holder = arena.add(0, "scroll-holder");
+            arena.add(holder, "scroll-leaf");
+            arena.add(holder, "b-inside");
+            arena
+        };
+        let (_, plain) = run_shaped(build(), Shape::default(), false);
+        assert_eq!(
+            outline(&plain),
+            [
+                line(0, "scroll-alone", Some(1), None),
+                line(0, "b-one", Some(2), None),
+                line(0, "scroll-holder", Some(3), None),
+                line(1, "scroll-leaf", Some(4), None),
+                line(1, "b-inside", Some(5), None),
+            ]
+        );
+        let (ended, walked) = run_shaped(build(), INTERACTIVE, false);
+        assert!(matches!(ended, Ended::Whole));
+        assert_eq!(outline(&walked), [line(0, "b-one", Some(1), None), line(0, "scroll-holder", Some(2), None), line(1, "b-inside", Some(3), None)]);
+        assert_eq!(walked.refs, ["b-one", "scroll-holder", "b-inside"]);
+        // With a query, the same elements stay out unless they match and can do more.
+        let mut arena = Arena::new();
+        arena.add(0, "scroll-hit");
+        arena.add(0, "b-hit");
+        let (_, walked) = run_shaped(arena, INTERACTIVE, true);
+        assert_eq!(outline(&walked), [line(0, "b-hit", Some(1), None)]);
+    }
+
+    /// Reference-gaps G3: the 500-line limit counts the lines that are output, so the labels
+    /// `interactive_only` leaves out do not use it up and it reaches an element the plain walk
+    /// stops short of.
+    #[test]
+    fn the_line_limit_counts_output_lines_so_interactive_only_goes_deeper() {
+        let build = || {
+            let mut arena = Arena::new();
+            for group in 1..=10 {
+                let parent = arena.add(0, &format!("Group {group}"));
+                for number in 1..=60 {
+                    arena.add(parent, &format!("text {group}-{number}"));
+                }
+            }
+            let last = arena.add(0, "Last");
+            arena.add(last, "b-reached");
+            arena
+        };
+        let (_, plain) = run_shaped(build(), Shape::default(), false);
+        assert_eq!(plain.elements.len(), 500);
+        assert_eq!(plain.truncated, ["nodes"]);
+        assert!(plain.refs.is_empty());
+        let (ended, walked) = run_shaped(build(), INTERACTIVE, false);
+        assert!(matches!(ended, Ended::Whole));
+        assert_eq!(outline(&walked), [line(0, "Last", None, None), line(1, "b-reached", Some(1), None)]);
+        assert!(walked.truncated.is_empty(), "{:?}", walked.truncated);
+        // The limit still holds for what is output.
+        let mut arena = Arena::new();
+        for group in 1..=9 {
+            let parent = arena.add(0, &format!("Group {group}"));
+            for number in 1..=60 {
+                arena.add(parent, &format!("b{group}-{number}"));
+            }
+        }
+        let (_, walked) = run_shaped(arena, INTERACTIVE, false);
+        assert_eq!(walked.elements.len(), 500);
+        assert_eq!(walked.truncated, ["nodes"]);
+    }
+
+    /// Reference-gaps G3: a parent still shows 60 children and counts the rest as omitted; with
+    /// `interactive_only` they are its numbered ones, so labels between them do not use the 60.
+    #[test]
+    fn interactive_only_keeps_the_child_limit() {
+        let mut arena = Arena::new();
+        let list = arena.add(0, "List");
+        for number in 1..=65 {
+            arena.add(list, &format!("b{number}"));
+            arena.add(list, &format!("text {number}"));
+        }
+        let (_, walked) = run_shaped(arena, INTERACTIVE, false);
+        let lines = outline(&walked);
+        assert_eq!(lines[0], line(0, "List", None, Some(5)));
+        assert_eq!(lines.len(), 61);
+        assert_eq!(lines[60], line(1, "b60", Some(60), None));
+        assert!(walked.truncated.is_empty(), "{:?}", walked.truncated);
+    }
+
+    /// Reference-gaps G3: with a query, only the numbered elements that match are kept, with their
+    /// ancestors: a label that matches is not.
+    #[test]
+    fn interactive_only_with_a_query_keeps_matching_numbered_elements() {
+        let mut arena = Arena::new();
+        arena.add(0, "text hit");
+        let group = arena.add(0, "Group");
+        arena.add(group, "text hit under group");
+        arena.add(group, "b-hit one");
+        arena.add(group, "b-other");
+        arena.add(0, "b-hit two");
+        let (_, walked) = run_shaped(arena, INTERACTIVE, true);
+        assert_eq!(outline(&walked), [line(0, "Group", None, None), line(1, "b-hit one", Some(1), None), line(0, "b-hit two", Some(2), None)]);
+    }
+
+    /// Reference-gaps G3: both together. A label whose numbered descendants are past the depth is
+    /// not shown (it is `truncated: depth`), a numbered element at the last level counts what is
+    /// below it.
+    #[test]
+    fn interactive_only_with_max_depth_shows_numbered_elements_within_the_depth() {
+        let mut arena = Arena::new();
+        let group = arena.add(0, "Group");
+        let button = arena.add(group, "b-x");
+        arena.add(button, "text below");
+        let sub = arena.add(group, "Sub");
+        arena.add(sub, "b-too deep");
+        let (_, walked) = run_shaped(arena, Shape { max_depth: Some(2), interactive_only: true }, false);
+        assert_eq!(outline(&walked), [line(0, "Group", None, None), line(1, "b-x", Some(1), Some(1))]);
+        assert_eq!(walked.truncated, ["depth"]);
+    }
+
+    /// Reference-gaps G3: the parameters are validated by the helper too.
+    #[test]
+    fn the_shape_is_read_from_the_params_and_a_bad_one_is_invalid_params() {
+        let code = |params: serde_json::Value| Shape::from_params(&params).map_err(|failure| failure.code);
+        assert_eq!(code(json!({})), Ok(Shape::default()));
+        assert_eq!(code(json!({ "max_depth": 1, "interactive_only": true })), Ok(Shape { max_depth: Some(1), interactive_only: true }));
+        assert_eq!(code(json!({ "max_depth": 30, "interactive_only": false })), Ok(Shape { max_depth: Some(30), interactive_only: false }));
+        for bad in [json!({ "max_depth": 0 }), json!({ "max_depth": 31 }), json!({ "max_depth": -1 }), json!({ "max_depth": 1.5 }), json!({ "max_depth": "3" }), json!({ "max_depth": null }), json!({ "interactive_only": 1 }), json!({ "interactive_only": null })] {
+            assert_eq!(code(bad.clone()), Err("invalid_params".to_string()), "{bad}");
+        }
+    }
+
+    /// Reference-gaps G3 (ticket 06): a walk the way `walk` runs one that starts at `root` (the
+    /// roots `walk_roots` gives; asking for the popups would panic).
+    fn run_subtree(arena: Arena, root: usize, shape: Shape, searching: bool) -> (Ended, Walked<String>) {
+        let arena = Rc::new(arena);
+        let node = |id| Fake(Rc::clone(&arena), id);
+        let roots = match walk_roots(node(0), Some(node(root)), || -> Result<Vec<Fake>, Ended> { panic!("the popups of a window are not read for a subtree") }) {
+            Ok(roots) => roots,
+            Err(_) => panic!("no popups were asked for"),
+        };
+        let walked = Mutex::new(Walked::default());
+        let keep = |node: &Fake| node.0.labels[node.1].clone();
+        let describe = |node: &Fake, depth| if shape.interactive_only { only_interactive(seen(node, depth), searching) } else { seen(node, depth) };
+        let ended = if !searching && !shape.interactive_only {
+            walk_tree(roots, shape.max_depth, describe, keep, &walked, || None)
+        } else {
+            walk_matching(roots, shape.max_depth, describe, keep, &walked, || None)
+        };
+        (ended, walked.into_inner().unwrap())
+    }
+
+    /// A window (node 0) with the element to read the subtree of, `b-pane`, among its children, a
+    /// popup of the window's (`Menu`, under a skipped desktop) and elements outside the pane.
+    /// Returns the arena, the pane and the popup.
+    fn pane_arena() -> (Arena, usize, usize) {
+        let mut arena = Arena::new();
+        arena.add(0, "b-before");
+        let pane = arena.add(0, "b-pane");
+        let list = arena.add(pane, "b-list");
+        arena.add(list, "b-hit item");
+        arena.add(pane, "text in pane");
+        arena.add(0, "b-after");
+        let desktop = arena.add(0, "skip desktop");
+        let menu = arena.add(desktop, "Menu");
+        arena.add(menu, "b-menu item");
+        (arena, pane, menu)
+    }
+
+    /// Reference-gaps G3 (ticket 06): the subtree is the root and what is below it, with the root
+    /// at depth 0 and numbered 1, and nothing of the window around it or of its popups.
+    #[test]
+    fn a_subtree_walk_starts_at_the_root_as_level_zero_and_leaves_out_the_popups() {
+        let (arena, pane, _) = pane_arena();
+        let (ended, walked) = run_subtree(arena, pane, Shape::default(), false);
+        assert!(matches!(ended, Ended::Whole));
+        assert_eq!(
+            outline(&walked),
+            [line(0, "b-pane", Some(1), None), line(1, "b-list", Some(2), None), line(2, "b-hit item", Some(3), None), line(1, "text in pane", None, None)]
+        );
+        assert_eq!(walked.refs, ["b-pane", "b-list", "b-hit item"]);
+        assert!(walked.truncated.is_empty(), "{:?}", walked.truncated);
+    }
+
+    /// Reference-gaps G3 (ticket 06): `max_depth` counts from the root, which is the first level.
+    #[test]
+    fn max_depth_of_a_subtree_counts_from_the_root() {
+        let (arena, pane, _) = pane_arena();
+        let (_, walked) = run_subtree(arena, pane, depth(1), false);
+        assert_eq!(outline(&walked), [line(0, "b-pane", Some(1), Some(2))]);
+        assert_eq!(walked.truncated, ["depth"]);
+        let (arena, pane, _) = pane_arena();
+        let (_, walked) = run_subtree(arena, pane, depth(2), false);
+        assert_eq!(outline(&walked), [line(0, "b-pane", Some(1), None), line(1, "b-list", Some(2), Some(1)), line(1, "text in pane", None, None)]);
+        assert_eq!(walked.truncated, ["depth"]);
+        let (arena, pane, _) = pane_arena();
+        let (_, walked) = run_subtree(arena, pane, depth(3), false);
+        assert_eq!(walked.elements.len(), 4);
+        assert!(walked.truncated.is_empty(), "{:?}", walked.truncated);
+    }
+
+    /// Reference-gaps G3 (ticket 06): a subtree combines with `interactive_only` and a query; the
+    /// root is the ancestor of what is kept.
+    #[test]
+    fn a_subtree_walk_combines_with_interactive_only_and_a_query() {
+        let (arena, pane, _) = pane_arena();
+        let (_, walked) = run_subtree(arena, pane, INTERACTIVE, false);
+        assert_eq!(outline(&walked), [line(0, "b-pane", Some(1), None), line(1, "b-list", Some(2), None), line(2, "b-hit item", Some(3), None)]);
+        let (arena, pane, _) = pane_arena();
+        let (_, walked) = run_subtree(arena, pane, Shape { max_depth: Some(2), interactive_only: true }, false);
+        assert_eq!(outline(&walked), [line(0, "b-pane", Some(1), None), line(1, "b-list", Some(2), Some(1))]);
+        let (arena, pane, _) = pane_arena();
+        let (_, walked) = run_subtree(arena, pane, Shape::default(), true);
+        assert_eq!(outline(&walked), [line(0, "b-pane", Some(1), None), line(1, "b-list", Some(2), None), line(2, "b-hit item", Some(3), None)]);
+        // A match outside the pane is not looked for.
+        let mut arena = Arena::new();
+        arena.add(0, "b-hit before");
+        let pane = arena.add(0, "b-pane");
+        arena.add(pane, "text");
+        let (_, walked) = run_subtree(arena, pane, Shape::default(), true);
+        assert!(walked.elements.is_empty());
+    }
+
+    /// Reference-gaps G3 (ticket 06): without a subtree the walk starts below the window and then
+    /// takes each popup, as it always did.
+    #[test]
+    fn without_a_subtree_the_roots_are_the_window_and_its_popups() {
+        let (arena, _, menu) = pane_arena();
+        let arena = Rc::new(arena);
+        let node = |id| Fake(Rc::clone(&arena), id);
+        let roots = match walk_roots(node(0), None, || Ok(vec![node(menu)])) {
+            Ok(roots) => roots,
+            Err(_) => panic!("popups were given"),
+        };
+        assert!(matches!(roots.as_slice(), [Root::ChildrenOf(window), Root::Itself(popup)] if window.1 == 0 && popup.1 == menu));
+        // A stop while the popups are looked up ends the walk.
+        assert!(matches!(walk_roots(node(0), None, || Err::<Vec<Fake>, _>(Ended::Stopped)), Err(Ended::Stopped)));
+    }
+
+    /// Reference-gaps G3 (ticket 06): the root is `{tree_id, root_element_index}`; the helper checks
+    /// it too, and `tree_id` means nothing without it.
+    #[test]
+    fn the_root_is_read_from_the_params_and_a_bad_one_is_invalid_params() {
+        let read = |params: serde_json::Value| root_ref(&params).map(|root| root.map(|root| (root.tree_id, root.index))).map_err(|failure| failure.code);
+        assert_eq!(read(json!({ "window_id": "5" })), Ok(None));
+        assert_eq!(read(json!({ "root_element_index": 2, "tree_id": "t1-abcde" })), Ok(Some(("t1-abcde".to_string(), 2))));
+        for bad in [
+            json!({ "root_element_index": 0, "tree_id": "t1" }),
+            json!({ "root_element_index": -1, "tree_id": "t1" }),
+            json!({ "root_element_index": 1.5, "tree_id": "t1" }),
+            json!({ "root_element_index": "2", "tree_id": "t1" }),
+            json!({ "root_element_index": null, "tree_id": "t1" }),
+            json!({ "root_element_index": 2 }),
+            json!({ "root_element_index": 2, "tree_id": "" }),
+            json!({ "root_element_index": 2, "tree_id": 7 }),
+            json!({ "tree_id": "t1" }),
+        ] {
+            assert_eq!(read(bad.clone()), Err("invalid_params".to_string()), "{bad}");
+        }
+    }
+
     fn run(arena: Arena, popups: &[usize]) -> (Ended, Walked<String>) {
         let arena = Rc::new(arena);
         let mut roots = vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))];
         roots.extend(popups.iter().map(|&id| Root::Itself(Fake(Rc::clone(&arena), id))));
         let walked = Mutex::new(Walked::default());
-        let ended = walk_tree(roots, seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, || None);
+        let ended = walk_tree(roots, None, seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, || None);
         (ended, walked.into_inner().unwrap())
     }
 
@@ -2706,7 +3871,7 @@ mod tests {
         arena.add(skipped, "b-never");
         let arena = Rc::new(arena);
         let walked = Mutex::new(Walked::default());
-        let ended = walk_tree(vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))], seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, || None);
+        let ended = walk_tree(vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))], None, seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, || None);
         assert!(matches!(ended, Ended::Whole));
         let walked = walked.into_inner().unwrap();
         let lines = outline(&walked);
@@ -2778,6 +3943,39 @@ mod tests {
         assert!(!line["states"].as_array().is_some_and(|states| states.iter().any(|state| state == "password")), "{line}");
     }
 
+    /// Followups 03: `describe` marks an element `interactive` when it can do more than be scrolled
+    /// into view: an interactive control type, or invoke, toggle, a settable value, expand/collapse,
+    /// selection or keyboard focus. A ScrollItem pattern alone numbers it (`actionable`) but is not enough.
+    #[test]
+    fn describe_calls_an_element_interactive_unless_it_can_only_be_scrolled_into_view() {
+        use super::{describe, Cached};
+        use windows::Win32::UI::Accessibility::{ExpandCollapseState_Collapsed, UIA_CONTROLTYPE_ID};
+        let frame = rect(0, 0, 500, 500);
+        let pane = || Cached { rect: Some(rect(10, 10, 110, 34)), control: Some(UIA_CONTROLTYPE_ID(50033)), name: "Pane".to_string(), enabled: true, scroll_item: true, ..Cached::default() };
+        let shown = |element: &Cached| match describe(element, || None, 0, frame, &[frame], None) {
+            Seen::Shown { line, actionable, interactive, .. } => (line, actionable, interactive),
+            _ => panic!("the element is not shown"),
+        };
+        let (line, actionable, interactive) = shown(&pane());
+        assert!(actionable && !interactive, "{line}");
+        assert_eq!(line["actions"], json!(["click", "scroll_into_view"]), "{line}");
+        let button = Cached { control: Some(UIA_CONTROLTYPE_ID(50000)), ..pane() };
+        assert!(shown(&button).2, "a button");
+        let others = [
+            ("invoke", Cached { invoke: true, ..pane() }),
+            ("toggle", Cached { toggle: Some(windows::Win32::UI::Accessibility::ToggleState_On), ..pane() }),
+            ("settable value", Cached { value_read_only: Some(false), ..pane() }),
+            ("expand", Cached { expand: Some(ExpandCollapseState_Collapsed), ..pane() }),
+            ("selection item", Cached { selected: Some(false), ..pane() }),
+            ("keyboard focusable", Cached { focusable: true, ..pane() }),
+        ];
+        for (what, element) in &others {
+            assert!(shown(element).2, "{what}");
+        }
+        // A read-only value alone is not more than a scroll.
+        assert!(!shown(&Cached { value_read_only: Some(true), ..pane() }).2);
+    }
+
     /// `get_ui_tree` takes what a walk has reached when its time is up, and a walk left behind
     /// goes on into an empty buffer: counting the children it leaves out of a line taken away
     /// with the rest must not panic (on the worker, which would then not leave COM).
@@ -2801,7 +3999,7 @@ mod tests {
             }
             None
         };
-        let ended = walk_tree(vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))], seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, take);
+        let ended = walk_tree(vec![Root::ChildrenOf(Fake(Rc::clone(&arena), 0))], None, seen, |node: &Fake| node.0.labels[node.1].clone(), &walked, take);
         assert!(matches!(ended, Ended::Whole));
         let rest = walked.into_inner().unwrap();
         assert!(rest.elements.is_empty(), "{:?}", rest.elements);
@@ -2883,7 +4081,7 @@ mod tests {
         let mut arena = Arena::new();
         arena.add(0, "b1");
         let walked = Mutex::new(Walked::default());
-        let ended = walk_tree(vec![Root::ChildrenOf(Fake(Rc::new(arena), 0))], seen, |_: &Fake| String::new(), &walked, || Some(Ended::Stopped));
+        let ended = walk_tree(vec![Root::ChildrenOf(Fake(Rc::new(arena), 0))], None, seen, |_: &Fake| String::new(), &walked, || Some(Ended::Stopped));
         assert!(matches!(ended, Ended::Stopped));
         assert!(walked.into_inner().unwrap().elements.is_empty());
     }
@@ -2966,6 +4164,59 @@ mod tests {
         };
         assert_eq!(super::read_back(read, |state| state == "on", Duration::from_secs(5), Instant::now()).ok(), Some(Some("off")));
         assert_eq!(reads.get(), 1);
+    }
+
+    /// Reference-gaps G5: a scroll's name is one of four directions, the vertical ones are up and
+    /// down, and a scroll step is one small increment along its axis and none along the other.
+    #[test]
+    fn scroll_directions_are_one_small_increment_along_their_axis() {
+        use super::ScrollDirection::{Down, Left, Right, Up};
+        use windows::Win32::UI::Accessibility::{ScrollAmount_NoAmount, ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement};
+        assert_eq!(super::ScrollDirection::parse("up"), Some(Up));
+        assert_eq!(super::ScrollDirection::parse("right"), Some(Right));
+        assert_eq!(super::ScrollDirection::parse("sideways"), None);
+        assert_eq!(super::ScrollDirection::parse(""), None);
+        assert!(Up.vertical() && Down.vertical() && !Left.vertical() && !Right.vertical());
+        assert_eq!(Down.amounts(), (ScrollAmount_NoAmount, ScrollAmount_SmallIncrement));
+        assert_eq!(Up.amounts(), (ScrollAmount_NoAmount, ScrollAmount_SmallDecrement));
+        assert_eq!(Right.amounts(), (ScrollAmount_SmallIncrement, ScrollAmount_NoAmount));
+        assert_eq!(Left.amounts(), (ScrollAmount_SmallDecrement, ScrollAmount_NoAmount));
+    }
+
+    /// Reference-gaps G5: a position that did not change, or only by a provider's rounding, did not move.
+    #[test]
+    fn a_scroll_position_moved_only_by_more_than_rounding() {
+        assert!(super::scrolled(0.0, 15.8));
+        assert!(super::scrolled(100.0, 84.2));
+        assert!(!super::scrolled(100.0, 100.0));
+        assert!(!super::scrolled(33.3333, 33.3334));
+    }
+
+    /// Reference-gaps G5: a wheel notch is +120 up and right, -120 down and left, on WM_MOUSEWHEEL
+    /// (vertical) or WM_MOUSEHWHEEL (horizontal); the delta is the high word of `wParam`.
+    #[test]
+    fn a_wheel_notch_has_the_message_and_delta_of_its_direction() {
+        use super::ScrollDirection::*;
+        use windows::Win32::UI::WindowsAndMessaging::{WM_MOUSEHWHEEL, WM_MOUSEWHEEL};
+        assert_eq!(super::wheel_notch(Down), (WM_MOUSEWHEEL, -120));
+        assert_eq!(super::wheel_notch(Up), (WM_MOUSEWHEEL, 120));
+        assert_eq!(super::wheel_notch(Right), (WM_MOUSEHWHEEL, 120));
+        assert_eq!(super::wheel_notch(Left), (WM_MOUSEHWHEEL, -120));
+        assert_eq!(super::wheel_wparam(120).0, 0x0078_0000);
+        assert_eq!(super::wheel_wparam(-120).0 >> 16, 0xFF88);
+        assert_eq!(super::wheel_wparam(-120).0 & 0xFFFF, 0);
+    }
+
+    /// Reference-gaps G5: a screen point is packed as two signed 16-bit words, which a point left
+    /// of or above the primary monitor (negative) must survive.
+    #[test]
+    fn a_screen_point_is_packed_as_two_signed_16_bit_words() {
+        let unpack = |lparam: windows::Win32::Foundation::LPARAM| ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
+        assert_eq!(unpack(super::point_lparam((100, 200))), (100, 200));
+        assert_eq!(unpack(super::point_lparam((-5, 7))), (-5, 7));
+        assert_eq!(unpack(super::point_lparam((1920, -1080))), (1920, -1080));
+        assert_eq!(unpack(super::point_lparam((-1, -1))), (-1, -1));
+        assert_eq!(super::point_lparam((-5, -7)).0, 0xFFF9_FFFB);
     }
 
     /// Ticket 66: `settle` takes the interval it reads at and the margin it keeps before the
@@ -3322,5 +4573,146 @@ mod tests {
         use windows::Win32::UI::Accessibility::{UIA_LegacyIAccessibleValuePropertyId, UIA_ValueValuePropertyId};
         assert!(!super::TREE_PROPERTIES.contains(&UIA_ValueValuePropertyId));
         assert!(!super::TREE_PROPERTIES.contains(&UIA_LegacyIAccessibleValuePropertyId));
+    }
+
+    fn parts(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| text.to_string()).collect()
+    }
+
+    #[test]
+    fn read_text_joins_the_ranges_that_hold_text_with_line_breaks_and_counts_them() {
+        use super::{join_text, JoinedText};
+        assert_eq!(join_text(&parts(&["one", "", "two", "three"]), 0, 100), JoinedText { text: "one\ntwo\nthree".to_string(), more: false, ranges: 3 });
+        assert_eq!(join_text(&parts(&["only"]), 0, 100), JoinedText { text: "only".to_string(), more: false, ranges: 1 });
+        // No range, or only empty ones: a normal result with no text.
+        assert_eq!(join_text(&[], 0, 100), JoinedText { text: String::new(), more: false, ranges: 0 });
+        assert_eq!(join_text(&parts(&["", ""]), 0, 100), JoinedText { text: String::new(), more: false, ranges: 0 });
+    }
+
+    #[test]
+    fn read_text_cuts_on_code_points_never_inside_a_surrogate_pair() {
+        use super::{join_text, JoinedText};
+        // "ab" and two emoji, each one code point but two UTF-16 units.
+        let text = parts(&["ab😀😀cd"]);
+        assert_eq!(join_text(&text, 0, 3), JoinedText { text: "ab😀".to_string(), more: true, ranges: 1 });
+        assert_eq!(join_text(&text, 0, 2), JoinedText { text: "ab".to_string(), more: true, ranges: 1 });
+        assert_eq!(join_text(&text, 0, 6), JoinedText { text: "ab😀😀cd".to_string(), more: false, ranges: 1 });
+        assert_eq!(join_text(&text, 0, 5), JoinedText { text: "ab😀😀c".to_string(), more: true, ranges: 1 });
+        // The line break counts as a character.
+        assert_eq!(join_text(&parts(&["ab", "cd"]), 0, 3), JoinedText { text: "ab\n".to_string(), more: true, ranges: 2 });
+        assert_eq!(join_text(&parts(&["ab", "cd"]), 0, 5), JoinedText { text: "ab\ncd".to_string(), more: false, ranges: 2 });
+    }
+
+    /// Reads all of `text` in pieces as a client does, and gives the pieces.
+    fn pieces_of(text: &str, max_chars: usize) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut offset = 0;
+        loop {
+            // What a provider gives for the units asked: at most that many, perhaps ending in half a pair.
+            let asked = usize::try_from(super::read_text_units(offset, max_chars)).unwrap();
+            let units: Vec<u16> = text.encode_utf16().take(asked).collect();
+            let answer = String::from_utf16_lossy(&units);
+            let read = super::join_text(&[answer], offset, max_chars);
+            offset += read.text.chars().count();
+            let more = read.more;
+            pieces.push(read.text);
+            if !more {
+                return pieces;
+            }
+        }
+    }
+
+    #[test]
+    fn read_text_pieces_join_to_the_original_whatever_the_cut_and_the_pairs() {
+        // Pairs at every phase: all pairs, one unit then pairs (the units asked for end inside a
+        // pair), numbers between pairs. The long one is over the limit, with cuts of real size.
+        let numbered = |segments: usize| -> String { (0..segments).map(|n| format!("x{n:04}😀😀😀")).collect() };
+        let cases = [
+            ("😀".repeat(300), vec![1, 2, 3, 7, 8, 333]),
+            (format!("a{}", "😀".repeat(300)), vec![1, 2, 3, 7, 8, 333]),
+            (numbered(40), vec![1, 2, 3, 7, 8, 333]),
+            (format!("a{}", numbered(9_000)), vec![333, 7_777, 20_000]),
+        ];
+        for (document, sizes) in &cases {
+            for &max_chars in sizes {
+                let pieces = pieces_of(document, max_chars);
+                assert!(pieces.concat() == *document, "max_chars {max_chars}: the pieces do not join to the original");
+                assert!(pieces.iter().all(|piece| piece.chars().count() <= max_chars), "max_chars {max_chars}");
+                assert!(!pieces.iter().any(|piece| piece.contains('\u{FFFD}')), "max_chars {max_chars}: half a pair");
+            }
+        }
+    }
+
+    #[test]
+    fn read_text_says_more_exactly_at_the_end_of_the_text() {
+        use super::{join_text, JoinedText};
+        let text = parts(&["ab😀cd"]);
+        // Up to the last character there is a next piece; the piece that reaches the end has none.
+        assert_eq!(join_text(&text, 1, 3), JoinedText { text: "b😀c".to_string(), more: true, ranges: 1 });
+        assert_eq!(join_text(&text, 2, 3), JoinedText { text: "😀cd".to_string(), more: false, ranges: 1 });
+        assert_eq!(join_text(&text, 3, 3), JoinedText { text: "cd".to_string(), more: false, ranges: 1 });
+        // At and past the end: empty, nothing more, the ranges still counted.
+        assert_eq!(join_text(&text, 5, 3), JoinedText { text: String::new(), more: false, ranges: 1 });
+        assert_eq!(join_text(&text, usize::MAX, 3), JoinedText { text: String::new(), more: false, ranges: 1 });
+    }
+
+    #[test]
+    fn read_text_applies_an_offset_to_the_joined_ranges_with_their_line_breaks() {
+        use super::{join_text, JoinedText};
+        let ranges = parts(&["ab", "", "😀d"]);
+        assert_eq!(join_text(&ranges, 2, 2), JoinedText { text: "\n😀".to_string(), more: true, ranges: 2 });
+        assert_eq!(join_text(&ranges, 3, 100), JoinedText { text: "😀d".to_string(), more: false, ranges: 2 });
+    }
+
+    #[test]
+    fn read_text_asks_for_enough_units_for_the_piece_and_one_more_character() {
+        use super::read_text_units;
+        // The most units `offset + max_chars + 1` code points can take; the same as before at offset 0.
+        assert_eq!(read_text_units(0, 20_000), 40_002);
+        assert_eq!(read_text_units(20_000, 20_000), 80_002);
+        // Past what the call can ask for: no limit (-1), so a huge offset is an empty result, not a failure.
+        assert_eq!(read_text_units(1 << 31, 1), -1);
+        assert_eq!(read_text_units(usize::MAX, 20_000), -1);
+    }
+
+    #[test]
+    fn read_text_offset_is_a_whole_number_of_zero_or_more() {
+        use super::read_text_offset;
+        assert_eq!(read_text_offset(&json!({})).ok(), Some(0));
+        assert_eq!(read_text_offset(&json!({ "offset": 0 })).ok(), Some(0));
+        assert_eq!(read_text_offset(&json!({ "offset": 12 })).ok(), Some(12));
+        for bad in [json!(-1), json!(1.5), json!("3"), json!(null), json!(true)] {
+            assert!(read_text_offset(&json!({ "offset": bad })).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod late_watch_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_action_whose_own_call_timed_out_keeps_its_watch() {
+        assert!(keeps_watching(true, Waiting::Act));
+        for waiting in [Waiting::Aim, Waiting::Prepare, Waiting::ReadBack] {
+            assert!(!keeps_watching(true, waiting), "{waiting:?}");
+        }
+        for waiting in [Waiting::Aim, Waiting::Prepare, Waiting::Act, Waiting::ReadBack] {
+            assert!(!keeps_watching(false, waiting), "an answered action ends its watch as usual: {waiting:?}");
+        }
+    }
+
+    #[test]
+    fn the_job_says_it_returned_however_it_ends() {
+        let returned = Arc::new(AtomicBool::new(false));
+        drop(SetOnDrop(returned.clone()));
+        assert!(returned.load(Ordering::SeqCst));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let flag = SetOnDrop(panicked.clone());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _flag = flag;
+            panic!("a job that panics");
+        }));
+        assert!(panicked.load(Ordering::SeqCst));
     }
 }

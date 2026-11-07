@@ -321,3 +321,61 @@ test("launch still succeeds when no window appears within 10 seconds", async () 
     await harness.close();
   }
 });
+
+test("a file that is not an .exe is not launched: a script or shortcut would run another program", async () => {
+  for (const file of [String.raw`C:\Users\me\run.bat`, String.raw`C:\Users\me\run.CMD`, String.raw`C:\Users\me\Demo.lnk`, String.raw`C:\Users\me\x.ps1`, String.raw`C:\Users\me\x.exe.vbs`]) {
+    const harness = await connectServer({
+      elicitation: "form",
+      resolveApp: async () => file,
+      script: { handlers: { launch_app: [{ result: launched }] } },
+    });
+    try {
+      const result = await harness.client.callTool({ name: "computer_launch_app", arguments: { app: file } });
+      assert.equal(result.isError, true, file);
+      assert.equal(textContent(result).split(/\r?\n/)[0], "invalid_params", file);
+      assert.match(textContent(result), /\.exe files only/, file);
+      assert.equal(harness.elicitations.length, 0, file);
+      assert.equal(sent(await harness.requests(), "launch_app").length, 0, file);
+    } finally {
+      await harness.close();
+    }
+  }
+});
+
+test("an app_id whose shortcut resolves to a script is not launched", async () => {
+  const harness = await connectServer({
+    elicitation: "form",
+    resolveApp: async (app) => app,
+    script: { handlers: { resolve_app_id: [{ result: { app: String.raw`C:\Tools\start.cmd` } }], launch_app: [{ result: launched }] } },
+  });
+  try {
+    const result = await harness.client.callTool({ name: "computer_launch_app", arguments: { app_id: "shell:Contoso.Starter" } });
+    assert.equal(textContent(result).split(/\r?\n/)[0], "invalid_params");
+    assert.equal(harness.elicitations.length, 0);
+    assert.equal(sent(await harness.requests(), "launch_app").length, 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a renamed copy of a shell is refused at its launch, before it is started", async () => {
+  const copy = String.raw`C:\Users\me\Downloads\tool.exe`;
+  const harness = await connectServer({
+    elicitation: "form",
+    resolveApp: async () => copy,
+    script: {
+      handlers: {
+        app_identity: [{ result: { signed: true, signer: "C=US, S=Washington, L=Redmond, O=Microsoft Corporation, CN=Microsoft Windows", file_name: "tool.exe", original_name: "cmd.exe" } }],
+        launch_app: [{ result: launched }],
+      },
+    },
+  });
+  try {
+    const result = await harness.client.callTool({ name: "computer_launch_app", arguments: { app: copy } });
+    assert.equal(textContent(result).split(/\r?\n/)[0], "blocked_app");
+    assert.equal(harness.elicitations.length, 0);
+    assert.equal(sent(await harness.requests(), "launch_app").length, 0);
+  } finally {
+    await harness.close();
+  }
+});

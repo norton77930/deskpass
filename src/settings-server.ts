@@ -16,6 +16,7 @@ import { latestLogDay, LOG_ROWS_MAX, logDay, logDays, retentionSentence } from "
 import { APP_CSS, APP_JS, appPageHtml } from "./settings-page.ts";
 import { readAllowBackgroundOrUnreadable, SETTINGS_FILE, writeAllowBackground } from "./settings-file.ts";
 import { fill, settingsText } from "./settings-strings.ts";
+import { systemTool } from "./system-tools.ts";
 import { uiLanguage, type UiLanguage } from "./ui-language.ts";
 
 /**
@@ -248,7 +249,7 @@ function openUrl(port: number, token: string): string {
 /** Opens `url` with the user's default browser (Windows' URL handler: no shell parses it). */
 function openInDefaultBrowser(url: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn("rundll32.exe", ["url.dll,FileProtocolHandler", url], { detached: true, stdio: "ignore", windowsHide: true });
+    const child = spawn(systemTool("rundll32.exe"), ["url.dll,FileProtocolHandler", url], { detached: true, stdio: "ignore", windowsHide: true });
     child.once("error", reject);
     child.once("spawn", () => {
       child.unref();

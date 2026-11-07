@@ -203,7 +203,14 @@ function describe(value: Fields, options: Required<Pick<LogReadOptions, "localTi
     case "approval": {
       const answer = str(value.answer);
       const text = LOG_TEXT.approval;
-      const what = channel === "dialog" ? text.dialog : channel === "elicitation" ? text.elicitation : text.other;
+      const what =
+        value.subject === "system_key"
+          ? fill(channel === "dialog" ? text.systemKeyAsked : text.systemKey, { combination: str(value.combination) })
+          : channel === "dialog"
+            ? text.dialog
+            : channel === "elicitation"
+              ? text.elicitation
+              : text.other;
       const tag =
         channel === "grant" && answer === "allow_always"
           ? text.grantAllowAlways

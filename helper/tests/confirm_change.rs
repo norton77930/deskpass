@@ -87,7 +87,7 @@ fn the_focus_starts_on_cancel_and_enter_cancels() {
     let window = wait_for_window(helper.pid(), CONFIRM_CLASS);
     wait_until(|| unsafe { GetForegroundWindow() } == window, "the window did not take the foreground");
     let cancel = unsafe { GetDlgItem(Some(window), CANCEL_ID) }.expect("cancel button");
-    wait_until(|| focus_of(window) == Some(cancel), "the focus is not on 取消");
+    wait_until(|| focus_of(window) == Some(cancel), "the focus is not on Cancel");
     let pressed = answer(helper.pid(), "enter");
     assert_eq!(pressed["foreground"], true, "{pressed}");
     let response = helper.wait(asked, Duration::from_secs(5));

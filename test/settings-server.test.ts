@@ -644,7 +644,7 @@ async function tighteningCase(): Promise<Case> {
   return c;
 }
 
-test("設為高風險 on an always-allowed app raises it and revokes its grant in the same write; a running MCP server's store sees it at its next check", async () => {
+test("Set to high risk on an always-allowed app raises it and revokes its grant in the same write; a running MCP server's store sees it at its next check", async () => {
   const c = await tighteningCase();
   try {
     const tab = await tabOf(c);
@@ -691,7 +691,7 @@ test("設為高風險 on an always-allowed app raises it and revokes its grant i
   }
 });
 
-test("設為封鎖 on a user-raised app and on a built-in high one; 取消永遠允許 removes only the grant", async () => {
+test("Set to blocked on a user-raised app and on a built-in high one; Remove always allow removes only the grant", async () => {
   const c = await tighteningCase();
   try {
     const tab = await tabOf(c);
@@ -833,7 +833,7 @@ test("ticket 133: a Start Menu app the AI never used is not listed and is refuse
   }
 });
 
-test("ticket 133: the page has the filters AI 操作過, 你設定過, 封鎖 and 高風險, and no 全部", async () => {
+test("ticket 133: the page has the filters Used by the AI, Set by you, Blocked and High risk, and no All", async () => {
   const c = await makeCase();
   try {
     await c.launch();
@@ -845,8 +845,8 @@ test("ticket 133: the page has the filters AI 操作過, 你設定過, 封鎖 an
     assert.deepEqual(Object.keys(SETTINGS_TEXT.page.filterNotes), Object.keys(SETTINGS_TEXT.page.filters));
     assert.ok(page.includes('var FILTERS = ["used", "mine", "blocked", "high"];'), "the script's filters");
     assert.ok(!page.includes('"all"'), "no filter named all");
-    assert.ok(!page.includes('"全部"'), "no 全部 string (the log's 「全部 App」 is another)");
-    assert.ok(!page.includes("全部」"), "no 全部 note");
+    assert.ok(!page.includes('"全部"'), "no string for an All filter (the log's All apps, 全部 App, is a different one)");
+    assert.ok(!page.includes("全部」"), "no note quoting an All filter");
   } finally {
     await c.close();
   }
@@ -1175,7 +1175,7 @@ test("the log routes need the session cookie and refuse other origins and POSTs 
   }
 });
 
-test("the page has a 日誌 tab next to App, and its script reads the log routes", async () => {
+test("the page has a Log tab next to Apps, and its script reads the log routes", async () => {
   const { c, tab } = await logCase({});
   try {
     const page = await send(tab.port, "/", { headers: { cookie: tab.cookie } });
@@ -1238,7 +1238,7 @@ async function confirmRequests(dir: string): Promise<Record<string, unknown>[]> 
     .map((request) => request.params);
 }
 
-test("ticket 115: 恢復預設 opens the confirm window and writes nothing until it answers allow; the write verifies in a fresh store and is logged", async () => {
+test("ticket 115: Restore default opens the confirm window and writes nothing until it answers allow; the write verifies in a fresh store and is logged", async () => {
   const { c, tab } = await restoreCase([answer("allow", 800)]);
   try {
     const page = await send(tab.port, "/", { headers: { cookie: tab.cookie } });
@@ -1439,7 +1439,7 @@ test("ticket 115: a confirm the user takes longer than a helper request's usual 
   }
 });
 
-test("ticket 122: against a protocol-8 helper (before confirm_change) the grants cannot be verified, 恢復預設 answers 503 unavailable and no confirm window is asked for", async () => {
+test("ticket 122: against a protocol-8 helper (before confirm_change) the grants cannot be verified, Restore default answers 503 unavailable and no confirm window is asked for", async () => {
   const c = await makeCase({ version: "8", handlers: { confirm_change: [answer("allow")] } });
   try {
     await writeFile(join(c.dir, "grants.key"), FAKE_GRANT_KEY);
@@ -1511,7 +1511,7 @@ test("ticket 123: closing the settings server while the confirm window is open e
   }
 });
 
-test("ticket 123: a confirm helper that ends before the user answers settles the confirm as failed, and 恢復預設 can be confirmed again", async () => {
+test("ticket 123: a confirm helper that ends before the user answers settles the confirm as failed, and Restore default can be confirmed again", async () => {
   const { c, tab } = await restoreCase([{ delayMs: 300, exit: 1 }, answer("allow")]);
   try {
     const before = await readFile(join(c.dir, "grants.json"), "utf8");
@@ -1577,7 +1577,7 @@ test("ticket 126: a page reloaded while the confirm window is open finds the sam
   }
 });
 
-test("ticket 125: a raise equal to the built-in tier is never written, and one already in grants.json is shown and cleared by 恢復預設…", async () => {
+test("ticket 125: a raise equal to the built-in tier is never written, and one already in grants.json is shown and cleared by Restore default...", async () => {
   const c = await makeCase({ handlers: { confirm_change: [answer("allow")] } });
   try {
     await writeFile(join(c.dir, "grants.key"), FAKE_GRANT_KEY);
@@ -1628,7 +1628,7 @@ const settingsOf = async (tab: Tab) => {
   return { ...reply, json: JSON.parse(reply.body) as Record<string, unknown> };
 };
 
-test("ticket 146: the page has the 允許背景操作 switch, on by default, with no settings file", async () => {
+test("ticket 146: the page has the Allow background operation switch, on by default, with no settings file", async () => {
   const c = await makeCase();
   try {
     await c.launch();

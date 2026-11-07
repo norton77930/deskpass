@@ -151,7 +151,7 @@ test("an app the AI used and the Start Menu lists is one row, with the Start Men
   }
 });
 
-test("the page's search and filters: AI 操作過, 你設定過, 封鎖, 高風險 (no 全部), each with its count", () => {
+test("the page's search and filters: Used by the AI, Set by you, Blocked, High risk (no All), each with its count", () => {
   const page = new Function(`${APP_FILTER_JS}\nreturn { FILTERS: FILTERS, inFilter: inFilter, matchesQuery: matchesQuery, filterCounts: filterCounts };`)() as {
     FILTERS: string[];
     inFilter: (app: object, id: string) => boolean;

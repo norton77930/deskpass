@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { LOG_MAX_BYTES, LOG_RETENTION_DAYS } from "../src/config.ts";
 import { latestLogDay, logDay, logDays, retentionSentence } from "../src/settings-log.ts";
+import { SETTINGS_TEXT_EN } from "../src/settings-strings.ts";
 
 // Ticket 117 (first half): the Node side of the settings page's Log tab. Seam: fixture
 // `logs/YYYY-MM-DD.jsonl` files in a temp data folder in, the grouped rows of a day out. Sentences
@@ -121,7 +122,7 @@ test("a tool call is a sentence by the tool's name with its result as the tag", 
   assert.deepEqual(groups[1]!.rows, [{ time: "09:05", sentence: "列出 App", tag: "成功" }]);
 });
 
-test("ticket 146: a tool call that has a delivery is marked 背景 or 前景; a refused background action is listed with its tag, still marked 背景", async () => {
+test("ticket 146: a tool call that has a delivery is marked Background or Foreground; a refused background action is listed with its tag, still marked Background", async () => {
   const dir = await dataDir({
     "2026-10-20": [
       { ...call("09:00", DEMO, "ok", "computer_element_action"), delivery: "background" },
@@ -175,7 +176,7 @@ test("an approval is a sentence by its channel with the answer as the tag", asyn
   );
 });
 
-test("the clipboard's approval and read are about the app 剪貼簿 and a read says how many characters", async () => {
+test("the clipboard's approval and read are about the app Clipboard and a read says how many characters", async () => {
   const dir = await dataDir({
     "2026-10-20": [
       approval("09:00", null, "dialog", "allow_once", { subject: "clipboard" }),
@@ -192,6 +193,24 @@ test("the clipboard's approval and read are about the app 剪貼簿 and a read s
     { time: "09:02", sentence: "讀剪貼簿", tag: "20000 字(已截斷)" },
   ]);
   assert.deepEqual(day.apps.map((app) => app.name), ["剪貼簿"]);
+});
+
+test("a key combination's approval is about its app and names the combination", async () => {
+  const dir = await dataDir({
+    "2026-10-20": [
+      approval("09:00", DEMO, "dialog", "refuse", { subject: "system_key", combination: "alt+f4" }),
+      approval("09:01", DEMO, "session", "allow_once", { subject: "system_key", combination: "win+l" }),
+    ],
+  });
+  const zh = await logDay(dir, "2026-10-20", read);
+  assert.equal(zh.groups.length, 1);
+  assert.equal(zh.groups[0]!.app, "Demo");
+  assert.deepEqual(zh.groups[0]!.rows, [
+    { time: "09:00", sentence: "詢問是否允許組合鍵 alt+f4", tag: "你拒絕" },
+    { time: "09:01", sentence: "組合鍵 win+l", tag: "沿用你這次的允許" },
+  ]);
+  const en = await logDay(dir, "2026-10-20", { ...read, text: SETTINGS_TEXT_EN.logRows });
+  assert.deepEqual(en.groups[0]!.rows.map((row) => row.sentence), ["Asked to allow the key combination alt+f4", "Key combination win+l"]);
 });
 
 test("grant events of the server are sentences with their reason or count as the tag", async () => {
@@ -224,7 +243,7 @@ test("grant events of the server are sentences with their reason or count as the
   ]);
 });
 
-test("changes made on the settings page read 「你在設定網頁…」, and old panel lines 「你在控制台…」", async () => {
+test("zh-TW: changes made on the settings page start with \"You on the settings page\", and old control panel lines with \"You in the control panel\"", async () => {
   const settings = (time: string, extra: object) => ({ time: at(time), session: "settings", key: DEMO.key, ...extra });
   const panel = (time: string, extra: object) => ({ time: at(time), session: "panel", key: DEMO.key, ...extra });
   const dir = await dataDir({

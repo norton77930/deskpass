@@ -78,8 +78,8 @@ const OWN_PROCESS_WHY = "it is a process of Deskpass itself";
 /** Ticket 96: how strict each tier is; a raise counts only when it is stricter than the built-in tier. */
 export const TIER_RANK: Readonly<Record<Tier, number>> = { normal: 0, high: 1, blocked: 2 };
 
-/** Completes "in the blocked tier (...)" (or names the tier) for an app the user raised in the control panel. */
-export const RAISED_WHY = "the user raised it to this tier in the control panel";
+/** Completes "in the blocked tier (...)" (or names the tier) for an app the user raised on the settings page. */
+export const RAISED_WHY = "the user raised it to this tier on the settings page";
 
 /**
  * Ticket 96: the tier an app is treated in, decided in this one place for the approval check
@@ -167,6 +167,34 @@ export class SessionApprovals {
    * apart from the apps' keys, so no app key can ever stand for it.
    */
   clipboard: "allowed" | "refused" | undefined;
+
+  /**
+   * Reference-gaps G1: the key combinations the user answered about, by app and normalized
+   * combination, in this server's memory only: nothing here reaches the grants, and neither an app's
+   * approval nor its always-allow stands for them. As for an app, a refusal is kept under the app's
+   * path too (`refusedEarlier`) and an allow by `key` alone; an unanswered question changes nothing.
+   */
+  private readonly systemKeysAllowed = new Set<string>();
+  private readonly systemKeysRefused = new Set<string>();
+
+  /** What the user said about `combination` in the app of `key`, at `appPath`; a refusal counts first. */
+  systemKey(key: string, appPath: string, combination: string): "allowed" | "refused" | undefined {
+    if (this.systemKeysRefused.has(systemKeyId(key, combination)) || this.systemKeysRefused.has(systemKeyId(appKey(appPath), combination))) return "refused";
+    return this.systemKeysAllowed.has(systemKeyId(key, combination)) ? "allowed" : undefined;
+  }
+
+  allowSystemKey(key: string, combination: string): void {
+    this.systemKeysAllowed.add(systemKeyId(key, combination));
+  }
+
+  refuseSystemKey(key: string, appPath: string, combination: string): void {
+    this.systemKeysRefused.add(systemKeyId(key, combination));
+    this.systemKeysRefused.add(systemKeyId(appKey(appPath), combination));
+  }
+}
+
+function systemKeyId(key: string, combination: string): string {
+  return JSON.stringify([key, combination]);
 }
 
 export function appKey(appPath: string): string {
@@ -188,11 +216,14 @@ export function packageFamilyFromPath(appPath: string): string | null {
  * Ticket 91: the tier of `appPath`, by executable name (without regard to case) and, for a UWP
  * app, package family name; a process of this server or its helper (`ownPids`) is blocked.
  * `packageFamily` is the one ticket 93's app identity reports; when the identity could not be had,
- * the family is read from the install folder (`packageFamilyFromPath`).
+ * the family is read from the install folder (`packageFamilyFromPath`). `originalName` is the
+ * identity's `original_name`: the app is in the strictest tier either of its names is in, so a
+ * copy of cmd.exe saved under another name is still blocked. It can only make an app stricter.
  */
-export function classifyApp(appPath: string, ownPids: number[], pid?: number, packageFamily?: string): TierMatch {
+export function classifyApp(appPath: string, ownPids: number[], pid?: number, packageFamily?: string, originalName?: string | null): TierMatch {
   if (pid !== undefined && ownPids.includes(pid)) return { tier: "blocked", why: OWN_PROCESS_WHY };
-  const match = builtInGroup([executableStem(appPath)], [packageFamily ?? packageFamilyFromPath(appPath)]);
+  const stems = [executableStem(appPath), ...(originalName ? [executableStem(originalName)] : [])];
+  const match = builtInGroup(stems, [packageFamily ?? packageFamilyFromPath(appPath)]);
   return match ? { tier: match.tier, why: match.group.why } : { tier: "normal", why: null };
 }
 

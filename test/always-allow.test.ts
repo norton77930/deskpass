@@ -37,7 +37,7 @@ const demo = {
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const edge = { ...demo, window_id: "6", app: EDGE, app_name: "Microsoft Edge", title: "Edge", pid: 4343 };
 
-const signed = (signer = SIGNER, fileName = "demo.exe"): FakeHandler => ({ result: { signed: true, signer, file_name: fileName } });
+const signed = (signer = SIGNER, fileName = "demo.exe"): FakeHandler => ({ result: { signed: true, signer, file_name: fileName, original_name: fileName } });
 const unsigned = (fileName = "demo.exe"): FakeHandler => ({ result: { signed: false, signer: null, file_name: fileName } });
 const answer = (value: string): FakeHandler => ({ result: { answer: value } });
 const cannotShow: FakeHandler = { error: { code: "prompt_unavailable", message: "There is no interactive desktop." } };
@@ -96,7 +96,7 @@ const approveParams = (allowAlways: boolean, window: { app: string; app_name: st
   allow_always: allowAlways,
 });
 
-test("a signed normal app is asked through the dialog with 永遠允許 offered, even when the client has elicitation", async () => {
+test("a signed normal app is asked through the dialog with Always allow offered, even when the client has elicitation", async () => {
   const harness = await connect({ get_window: repeat(3, { result: demo }), app_identity: repeat(3, signed()), ask_user: [answer("allow")] });
   try {
     assert.notEqual((await typeText(harness)).isError, true);
@@ -114,7 +114,7 @@ test("a signed normal app is asked through the dialog with 永遠允許 offered,
   }
 });
 
-test("a packaged app is offered 永遠允許 too", async () => {
+test("a packaged app is offered Always allow too", async () => {
   const packaged: FakeHandler = { result: { signed: false, signer: null, file_name: "demo.exe", package_family_name: "Contoso.Demo_8wekyb3d8bbwe" } };
   const harness = await connect({ get_window: repeat(2, { result: demo }), app_identity: [packaged], ask_user: [answer("deny")] });
   try {
@@ -137,7 +137,7 @@ test("when the dialog cannot be shown for such an app, the call is refused appro
   }
 });
 
-test("an app that cannot be always allowed is asked as before: elicitation when the client has it, otherwise a dialog without 永遠允許", async () => {
+test("an app that cannot be always allowed is asked as before: elicitation when the client has it, otherwise a dialog without Always allow", async () => {
   // Unsigned and high-risk (signed Edge), with form elicitation: the elicitation asks.
   const withElicitation = await connect({
     get_window: [{ result: demo }, { result: edge }],
@@ -192,7 +192,7 @@ test("Elicitation Accept is allow-once only: it writes no grant", async () => {
   }
 });
 
-test("永遠允許 writes a signed grant; this server and a new one allow the app without asking", async () => {
+test("Always allow writes a signed grant; this server and a new one allow the app without asking", async () => {
   const before = Date.now();
   const first = await connect({ get_window: repeat(3, { result: demo }), app_identity: repeat(3, signed()), ask_user: [answer("allow_always")] });
   try {
@@ -378,6 +378,74 @@ test("a lone surrogate in the app's name or path is written as U+FFFD, so the he
     const signing = ((await harness.requests()) as Logged[]).filter((entry) => entry.method === "grant_mac");
     const fields = signing.flatMap((entry) => (entry.params?.entries as { fields: Record<string, unknown> }[]).flatMap((macEntry) => Object.values(macEntry.fields)));
     assert.equal(fields.some((value) => typeof value === "string" && /\p{Cs}/u.test(value)), false, "no grant_mac request holds a lone surrogate");
+  } finally {
+    await harness.close();
+  }
+});
+
+// A signature covers a file's content, never its name: a signed copy of another program saved
+// under an app's name is known by its path (its version resource names another program), and is in
+// the tier of either name.
+const copyOf = (originalName: string | null): FakeHandler => ({ result: { signed: true, signer: SIGNER, file_name: "demo.exe", original_name: originalName } });
+
+test("a signed copy of another program saved as an always-allowed app's name does not use its grant", async () => {
+  const first = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, signed()), ask_user: [answer("allow_always")] });
+  try {
+    assert.notEqual((await typeText(first)).isError, true);
+  } finally {
+    await first.finish();
+  }
+  const copy = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf("other.exe")), ask_user: [answer("deny")] }, { grantsDir: first.dir, elicitation: false });
+  try {
+    assert.equal(code(await typeText(copy)), "approval_declined");
+    // Asked, and without 永遠允許: it has no signer's identity.
+    assert.deepEqual(await asks(copy), [approveParams(false)]);
+    assert.deepEqual(await logged(copy, "grant_mismatch"), [{ event: "grant_mismatch", key: DEMO_KEY, current_key: "c:\\apps\\demo.exe", path: demo.app }]);
+    assert.equal((await grantsFile(first.dir))?.grants[0]?.key, DEMO_KEY, "the grant itself is kept");
+  } finally {
+    await copy.close();
+    await first.close();
+  }
+});
+
+test("a copy of a shell under another name is in the blocked tier: refused without asking, whatever grant its name has", async () => {
+  for (const original of ["cmd.exe", "PowerShell.EXE", "wt.exe"]) {
+    const harness = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf(original.toLowerCase())) });
+    try {
+      const result = await typeText(harness);
+      assert.equal(code(result), "blocked_app", original);
+      assert.match(textContent(result), /blocked tier/i, original);
+      assert.deepEqual(await asks(harness), [], original);
+      assert.equal(harness.elicitations.length, 0, original);
+    } finally {
+      await harness.close();
+    }
+  }
+});
+
+test("a signed Electron app keeps the always-allow it was given under its signer", async () => {
+  const first = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, signed()), ask_user: [answer("allow_always")] });
+  try {
+    assert.notEqual((await typeText(first)).isError, true);
+  } finally {
+    await first.finish();
+  }
+  const electron = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf("electron.exe")) }, { grantsDir: first.dir, elicitation: false });
+  try {
+    assert.notEqual((await typeText(electron)).isError, true);
+    assert.deepEqual(await asks(electron), [], "the grant applies, so nobody is asked");
+    assert.deepEqual(await logged(electron, "grant_mismatch"), []);
+  } finally {
+    await electron.close();
+    await first.close();
+  }
+});
+
+test("a signed app whose version resource names no program is asked allow-once only", async () => {
+  const harness = await connect({ get_window: repeat(2, { result: demo }), app_identity: repeat(2, copyOf(null)), ask_user: [answer("allow")] }, { elicitation: false });
+  try {
+    assert.notEqual((await typeText(harness)).isError, true);
+    assert.deepEqual(await asks(harness), [approveParams(false)]);
   } finally {
     await harness.close();
   }

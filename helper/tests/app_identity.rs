@@ -19,7 +19,26 @@ fn a_catalog_signed_system_executable_reports_its_signer() {
     // The leaf certificate's full subject, in the order the certificate encodes it.
     assert_eq!(identity["result"]["signer"], "C=US, S=Washington, L=Redmond, O=Microsoft Corporation, CN=Microsoft Windows", "{identity}");
     assert_eq!(identity["result"]["file_name"], "notepad.exe", "{identity}");
+    // Its own version resource names it, read without its .mui (which would say NOTEPAD.EXE.MUI).
+    assert_eq!(identity["result"]["original_name"], "notepad.exe", "{identity}");
     assert!(identity["result"].get("package_family_name").is_none(), "{identity}");
+}
+
+#[test]
+fn a_renamed_copy_of_a_signed_program_reports_the_program_it_is() {
+    let mut helper = Helper::spawn();
+    let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let folder = std::env::temp_dir().join(format!("deskpass-identity-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("temp folder");
+    // cmd.exe saved as notepad.exe: the signature still verifies (it covers the content, not the name).
+    let copy = folder.join("notepad.exe");
+    std::fs::copy(format!(r"{system}\System32\cmd.exe"), &copy).expect("copy cmd.exe");
+    let identity = helper.request("app_identity", json!({ "path": copy.to_string_lossy() }));
+    let _ = std::fs::remove_dir_all(&folder);
+    assert_eq!(identity["ok"], true, "{identity}");
+    assert_eq!(identity["result"]["signed"], true, "{identity}");
+    assert_eq!(identity["result"]["file_name"], "notepad.exe", "{identity}");
+    assert_eq!(identity["result"]["original_name"], "cmd.exe", "{identity}");
 }
 
 #[test]
@@ -34,6 +53,7 @@ fn an_embedded_signature_reports_the_same_signer_as_it_is_asked_again() {
     assert_eq!(first["result"]["signed"], true, "{first}");
     assert_eq!(first["result"]["signer"], "C=US, S=Washington, L=Redmond, O=Microsoft Corporation, CN=Microsoft Corporation", "{first}");
     assert_eq!(first["result"]["file_name"], "msedge.exe", "{first}");
+    assert_eq!(first["result"]["original_name"], "msedge.exe", "{first}");
     let again = helper.request("app_identity", json!({ "path": edge.to_ascii_uppercase() }));
     assert_eq!(again["result"]["signer"], first["result"]["signer"], "{again}");
     assert_eq!(again["result"]["file_name"], "msedge.exe", "the file name is lower case: {again}");

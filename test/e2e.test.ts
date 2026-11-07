@@ -32,9 +32,11 @@ const TOOLS = [
   "computer_move_mouse",
   "computer_zoom",
   "computer_wait",
+  "computer_wait_for",
   "computer_batch",
   "computer_list_apps",
   "computer_read_clipboard",
+  "computer_read_text",
 ];
 
 test("the stdio server entry lists every computer use tool", async () => {
@@ -198,6 +200,104 @@ test("end to end without elicitation: the helper dialog asks, and the user's all
   }
 });
 
+test("end to end: a dangerous combination waits for the real dialog; a refusal sends nothing and an allow presses it", { skip: NO_DESKTOP }, async () => {
+  const fixtureExe = builtExe("fixture-window.exe");
+  assert.ok(fixtureExe, "fixture-window.exe is missing; build the helper tests first");
+  const answerer = builtExe("prompt-answerer.exe");
+  assert.ok(answerer, "prompt-answerer.exe is missing; build the helper tests first");
+  const helper = builtExe("deskpass-helper.exe");
+  assert.ok(helper, "deskpass-helper.exe is missing");
+  const fixture = spawn(fixtureExe, [], { stdio: "ignore" });
+  const dir = await mkdtemp(join(repoRoot(), "test-tmp", "e2e-"));
+  const app = createServer({ lockDir: join(dir, "lock"), logDir: join(dir, "logs"), grantsDir: dir, helperPath: helper });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "deskpass-e2e", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([app.server.connect(serverTransport), client.connect(clientTransport)]);
+  const press = (key: string, windowId: string) => client.callTool({ name: "computer_press_key", arguments: { window_id: windowId, key } });
+  const pressAnswered = async (key: string, windowId: string, answer: string) => {
+    const answered = runAnswerer(answerer, ["--parent-pid", String(process.pid), "--press", answer, "--wait-ms", "15000"]);
+    const result = await press(key, windowId);
+    const shown = await answered;
+    assert.equal(shown.code, 0, shown.stderr);
+    return { result, text: (JSON.parse(shown.stdout) as { text?: string }).text ?? "" };
+  };
+  try {
+    const windowId = await waitForFixture(client);
+    const approved = runAnswerer(answerer, ["--parent-pid", String(process.pid), "--press", "allow", "--wait-ms", "15000"]);
+    const shot = await client.callTool({ name: "computer_screenshot", arguments: { window_id: windowId } });
+    assert.equal((await approved).code, 0);
+    assert.notEqual(shot.isError, true, textContent(shot));
+
+    const refused = await pressAnswered("alt+shift+f4", windowId, "deny");
+    assert.match(refused.text, /alt\+shift\+f4/, "the dialog does not name the combination");
+    assert.match(refused.text, /fixture-window\.exe/i, "the dialog does not name the app");
+    assert.equal(refused.result.isError, true, textContent(refused.result));
+    assert.match(textContent(refused.result), /approval_declined/);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(fixture.exitCode, null, "the refused combination reached the fixture");
+
+    const again = await press("alt+shift+f4", windowId);
+    assert.match(textContent(again), /approval_refused_earlier/, "a refused combination asked again");
+
+    const allowed = await pressAnswered("alt+f4", windowId, "allow");
+    assert.match(allowed.text, /alt\+f4/, "the dialog does not name the combination");
+    // ALT+F4 closes the fixture: its leaving is the proof that the allowed keys were sent.
+    const deadline = Date.now() + 5_000;
+    while (fixture.exitCode === null && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.notEqual(fixture.exitCode, null, `the allowed combination did not close the fixture: ${textContent(allowed.result)}`);
+  } finally {
+    await closeFixture(fixture);
+    await client.close();
+    await app.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("end to end: a foreground click holding Win waits for the real dialog, and its refusal also stands for computer_press_key", { skip: NO_DESKTOP }, async () => {
+  const fixtureExe = builtExe("fixture-window.exe");
+  assert.ok(fixtureExe, "fixture-window.exe is missing; build the helper tests first");
+  const answerer = builtExe("prompt-answerer.exe");
+  assert.ok(answerer, "prompt-answerer.exe is missing; build the helper tests first");
+  const helper = builtExe("deskpass-helper.exe");
+  assert.ok(helper, "deskpass-helper.exe is missing");
+  const fixture = spawn(fixtureExe, ["--ui-controls"], { stdio: "ignore" });
+  const dir = await mkdtemp(join(repoRoot(), "test-tmp", "e2e-"));
+  const app = createServer({ lockDir: join(dir, "lock"), logDir: join(dir, "logs"), grantsDir: dir, helperPath: helper });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "deskpass-e2e", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([app.server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const windowId = await waitForFixture(client);
+    const approved = runAnswerer(answerer, ["--parent-pid", String(process.pid), "--press", "allow", "--wait-ms", "15000"]);
+    const shot = await client.callTool({ name: "computer_screenshot", arguments: { window_id: windowId } });
+    assert.equal((await approved).code, 0);
+    assert.notEqual(shot.isError, true, textContent(shot));
+
+    // A background click holding Win stays refused without any question.
+    const background = await client.callTool({ name: "computer_click", arguments: { window_id: windowId, x: 5, y: 5, modifiers: ["win"], delivery_mode: "background" } });
+    assert.match(textContent(background), /background_unavailable/, textContent(background));
+
+    // The denied Win key is never pressed, so this cannot open the Start menu.
+    const answered = runAnswerer(answerer, ["--parent-pid", String(process.pid), "--press", "deny", "--wait-ms", "15000"]);
+    const refused = await client.callTool({ name: "computer_click", arguments: { window_id: windowId, x: 5, y: 5, modifiers: ["win"], delivery_mode: "foreground" } });
+    const shown = await answered;
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.match((JSON.parse(shown.stdout) as { text?: string }).text ?? "", /win/, "the dialog does not name the combination");
+    assert.equal(refused.isError, true, textContent(refused));
+    assert.match(textContent(refused), /approval_declined/);
+
+    const sharedPress = await client.callTool({ name: "computer_press_key", arguments: { window_id: windowId, key: "win" } });
+    assert.match(textContent(sharedPress), /approval_refused_earlier/, "computer_press_key win asked again after the click's refusal");
+    const sharedDrag = await client.callTool({ name: "computer_drag", arguments: { window_id: windowId, from_x: 5, from_y: 5, to_x: 9, to_y: 9, modifiers: ["win"] } });
+    assert.match(textContent(sharedDrag), /approval_refused_earlier/, textContent(sharedDrag));
+  } finally {
+    await closeFixture(fixture);
+    await client.close();
+    await app.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("end to end: read the tree, click a button and fill the edit by element number, read the new value", { skip: NO_DESKTOP }, async () => {
   const fixtureExe = builtExe("fixture-window.exe");
   assert.ok(fixtureExe, "fixture-window.exe is missing; build the helper tests first");
@@ -247,6 +347,61 @@ test("end to end: read the tree, click a button and fill the edit by element num
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("end to end: computer_wait_for sees a real window appear, is not fooled by minimizing or hiding it, and sees it close", { skip: NO_DESKTOP }, async () => {
+  const fixtureExe = builtExe("fixture-window.exe");
+  assert.ok(fixtureExe, "fixture-window.exe is missing; build the helper tests first");
+  const helper = builtExe("deskpass-helper.exe");
+  assert.ok(helper, "deskpass-helper.exe is missing");
+  const dir = await mkdtemp(join(repoRoot(), "test-tmp", "e2e-"));
+  const app = createServer({ lockDir: join(dir, "lock"), logDir: join(dir, "logs"), grantsDir: dir, helperPath: helper });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "deskpass-e2e", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([app.server.connect(serverTransport), client.connect(clientTransport)]);
+  let fixture: ChildProcess | undefined;
+  try {
+    const appearing = client.callTool({ name: "computer_wait_for", arguments: { condition: "window_appears", text: "cumcp_fixture", timeout_seconds: 15 } });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    fixture = spawn(fixtureExe, [], { stdio: "ignore" });
+    const appeared = await appearing;
+    assert.notEqual(appeared.isError, true, textContent(appeared));
+    const met = appeared.structuredContent as { met_after_ms: number; window_id: string };
+    assert.ok(met.met_after_ms >= 400, textContent(appeared));
+    const windowId = met.window_id;
+    assert.match(windowId, /^\d+$/, textContent(appeared));
+
+    for (const [state, command] of [["minimized", 6], ["hidden", 0]] as const) {
+      await showWindow(windowId, command);
+      const waiting = await client.callTool({ name: "computer_wait_for", arguments: { condition: "window_gone", window_id: windowId, timeout_seconds: 1 } });
+      assert.equal(waiting.isError, true, `a ${state} window counted as closed: ${textContent(waiting)}`);
+      assert.match(textContent(waiting), /wait_timeout|was not met/, textContent(waiting));
+      assert.match(textContent(waiting), /No input was sent/, textContent(waiting));
+    }
+
+    const closing = client.callTool({ name: "computer_wait_for", arguments: { condition: "window_gone", window_id: windowId, timeout_seconds: 15 } });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await closeFixture(fixture);
+    const closed = await closing;
+    assert.notEqual(closed.isError, true, textContent(closed));
+    assert.ok((closed.structuredContent as { met_after_ms: number }).met_after_ms >= 400, textContent(closed));
+  } finally {
+    if (fixture) await closeFixture(fixture);
+    await client.close();
+    await app.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * `ShowWindowAsync` on the window, from outside Deskpass: 6 minimizes, 0 hides. Never `spawnSync`: PowerShell
+ * can take seconds, and a blocked event loop makes the helper client time out a request the helper answered.
+ */
+async function showWindow(windowId: string, command: number): Promise<void> {
+  const script = `Add-Type -Namespace E2e -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int c);'; [void][E2e.W]::ShowWindowAsync([IntPtr]${windowId}, ${command}); Start-Sleep -Milliseconds 200`;
+  const child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: "ignore" });
+  const code = await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(code, 0, "ShowWindowAsync through PowerShell failed");
+}
 
 /** Polls `computer_list_windows` until the fixture's listed title satisfies `ok`, up to 5 seconds. */
 async function waitForTitle(client: Client, windowId: string, ok: (title: string) => boolean, message: string): Promise<void> {

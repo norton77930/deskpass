@@ -44,7 +44,7 @@ fn ping_reports_the_same_build_id() {
     };
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(reply["result"]["version"], "9", "{reply}");
+    assert_eq!(reply["result"]["version"], "17", "{reply}");
     assert_build_id(reply["result"]["build"].as_str().unwrap_or(""));
     assert_eq!(reply["result"]["build"], expected.as_str(), "{reply}");
 }

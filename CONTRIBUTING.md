@@ -32,6 +32,8 @@ npm run package
 
 `npm run package` writes `release/deskpass-<version>.zip` from the `dist/` you just built. It refuses to package a helper that is missing, does not match `dist/helper-build.json`, or is older than the sources in `helper/`.
 
+That zip is for trying a build. A published release is built by the Release workflow instead: set the version in `package.json`, `helper/Cargo.toml` (and `Cargo.lock`), `src/config.ts` and `CHANGELOG.md`, merge, then push the tag `v<version>`. The workflow builds, tests and packages on GitHub's runner and opens a draft release with the zip, its SHA-256 and a build provenance attestation; add the CHANGELOG section to the notes and publish it.
+
 ## Test
 
 ```powershell

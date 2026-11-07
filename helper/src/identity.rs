@@ -14,6 +14,12 @@
 //! retrieval comes from the cache only (`WTD_CACHE_ONLY_URL_RETRIEVAL`), so the check never waits on
 //! the network: an approval question must not hang on a CRL or OCSP server. A revoked certificate
 //! is therefore not noticed here.
+//!
+//! A signature covers a file's content, never its name: a copy of cmd.exe saved as tool.exe (or as
+//! notepad.exe) still verifies as Microsoft's. So the answer also has `original_name`, the
+//! `OriginalFilename` of the executable's own (language-neutral) version resource, which is part of
+//! what the signature covers. A signed file is known by its signer only when its file name is its
+//! original name (`identity_key`, and the server's `identityKey`); the tiers look at both names.
 
 use std::path::Path;
 
@@ -30,16 +36,20 @@ use windows::Win32::Security::WinTrust::{
     WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_CATALOG, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE,
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
 };
-use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, GetFileVersionInfoExW, GetFileVersionInfoSizeExW, VerQueryValueW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_VER_GET_NEUTRAL, OPEN_EXISTING,
+};
 use windows::Win32::Storage::Packaging::Appx::{GetPackageFamilyName, PackageFamilyNameFromFullName};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use crate::{apps, windows_list};
 
-/// `{ path, pid? }` → `{ signed, signer, file_name, package_family_name? }`. `pid`, when given, is
+/// `{ path, pid? }` → `{ signed, signer, file_name, original_name, package_family_name? }`. `pid`, when given, is
 /// a process running `path` (a window's), whose package identity is read directly; otherwise a
 /// package is recognized by its install folder. An executable that cannot be opened or verified is
-/// `signed: false`, not an error: the server treats it as unsigned either way.
+/// `signed: false`, not an error: the server treats it as unsigned either way. `original_name` is
+/// the version resource's `OriginalFilename` as `original_name_of` reads it, or null.
 pub fn app_identity(params: &Value) -> Result<Value, (String, String)> {
     let invalid = |message: &str| ("invalid_params".to_string(), message.to_string());
     let path = params
@@ -57,7 +67,77 @@ pub fn app_identity(params: &Value) -> Result<Value, (String, String)> {
         return Ok(json!({ "signed": false, "signer": null, "file_name": file_name, "package_family_name": family }));
     }
     let signer = verified_signer(path);
-    Ok(json!({ "signed": signer.is_some(), "signer": signer, "file_name": file_name }))
+    Ok(json!({ "signed": signer.is_some(), "signer": signer, "file_name": file_name, "original_name": original_name_of(path) }))
+}
+
+/// The `OriginalFilename` of `path`'s own version resource (`FILE_VER_GET_NEUTRAL`: never a `.mui`
+/// file beside it, which anyone could put next to a copy), as `normalized_original_name` writes
+/// it; None when the file has none or cannot be read. Each language the resource lists is tried,
+/// then the usual ones.
+fn original_name_of(path: &str) -> Option<String> {
+    let wide = windows_list::utf16(path);
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeExW(FILE_VER_GET_NEUTRAL, PCWSTR(wide.as_ptr()), &mut handle);
+        if size == 0 {
+            return None;
+        }
+        // u32 units, so the UTF-16 strings and the translation table inside are aligned.
+        let mut data = vec![0u32; (size as usize).div_ceil(4)];
+        GetFileVersionInfoExW(FILE_VER_GET_NEUTRAL, PCWSTR(wide.as_ptr()), None, size, data.as_mut_ptr().cast()).ok()?;
+        let block = data.as_ptr() as *const core::ffi::c_void;
+        let mut languages: Vec<(u16, u16)> = Vec::new();
+        let mut table: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut length = 0u32;
+        if VerQueryValueW(block, w!("\\VarFileInfo\\Translation"), &mut table, &mut length).as_bool() && !table.is_null() {
+            let words = std::slice::from_raw_parts(table as *const u16, (length as usize / 4) * 2);
+            languages.extend(words.chunks_exact(2).map(|pair| (pair[0], pair[1])));
+        }
+        languages.extend([(0x0409, 0x04B0), (0x0409, 0x04E4), (0x0000, 0x04B0)]);
+        for (language, codepage) in languages {
+            let query = windows_list::utf16(&format!("\\StringFileInfo\\{language:04x}{codepage:04x}\\OriginalFilename"));
+            let mut value: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut chars = 0u32;
+            if VerQueryValueW(block, PCWSTR(query.as_ptr()), &mut value, &mut chars).as_bool() && !value.is_null() && chars > 0 {
+                let text = from_wide(std::slice::from_raw_parts(value as *const u16, chars as usize));
+                if let Some(name) = normalized_original_name(&text) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// An `OriginalFilename` as the answer gives it: its last path part, lowercase, without the `.mui`
+/// some Windows binaries add (`Cmd.Exe.MUI` is `cmd.exe`); None when nothing is left.
+pub fn normalized_original_name(text: &str) -> Option<String> {
+    let name = text.trim().rsplit(['\\', '/']).next().unwrap_or("").trim().to_lowercase();
+    let name = name.strip_suffix(".mui").unwrap_or(&name).trim_end().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// A file name without `.exe`, lowercase: how a file name and an original name are compared.
+fn program_stem(name: &str) -> String {
+    let lower = name.to_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
+/// The original name every Electron app has (`is_original_name`), as `program_stem` writes it.
+const ELECTRON_STEM: &str = "electron";
+
+/// Whether the signed file `file_name` is the program its version resource names: only then is
+/// it known by its signer (a renamed copy of another program is known by its path). An original
+/// name of `electron` counts for any file name: every Electron app (VS Code's Code.exe, for one)
+/// keeps the name of the Electron binary it was built from. As `isOriginalName` in src/identity.ts.
+pub fn is_original_name(file_name: &str, original_name: Option<&str>) -> bool {
+    original_name.is_some_and(|original| {
+        if original.is_empty() {
+            return false;
+        }
+        let stem = program_stem(original);
+        stem == program_stem(file_name) || stem == ELECTRON_STEM
+    })
 }
 
 /// A drive path (`C:\...`) or a UNC path (`\\server\...`).
@@ -258,8 +338,9 @@ pub fn path_key(path: &str) -> String {
 
 /// Ticket 107: the key the server's `identityKey` (src/identity.ts) gives the executable `path`
 /// from the helper's `app_identity` answer `identity`: a package by its family (lowercase), a signed
-/// file by its signer and lowercase file name, anything else by its path (`path_key`). No answer,
-/// or one the server would not read (`readAppIdentity`), is the path's key, as the server falls back.
+/// file whose name is its original name (`is_original_name`) by its signer and lowercase file name,
+/// anything else by its path (`path_key`). No answer, or one the server would not read
+/// (`readAppIdentity`), is the path's key, as the server falls back.
 pub fn identity_key(path: &str, identity: Option<&Value>) -> String {
     let text = |identity: &Value, name: &str| identity.get(name).and_then(Value::as_str).filter(|text| !text.is_empty()).map(str::to_string);
     let readable = |identity: &&Value| {
@@ -268,14 +349,20 @@ pub fn identity_key(path: &str, identity: Option<&Value>) -> String {
             None => true,
             Some(family) => family.as_str().is_some_and(|family| !family.is_empty()),
         };
-        identity.is_object() && signed.is_some() && text(identity, "file_name").is_some() && (signed == Some(false) || text(identity, "signer").is_some()) && family_ok
+        let original_ok = match identity.get("original_name") {
+            None | Some(Value::Null) => true,
+            Some(original) => original.as_str().is_some_and(|original| !original.is_empty()),
+        };
+        identity.is_object() && signed.is_some() && text(identity, "file_name").is_some() && (signed == Some(false) || text(identity, "signer").is_some()) && family_ok && original_ok
     };
     if let Some(identity) = identity.filter(readable) {
         if let Some(family) = text(identity, "package_family_name") {
             return format!("package:{}", family.to_lowercase());
         }
         if let (Some(true), Some(signer), Some(file)) = (identity.get("signed").and_then(Value::as_bool), text(identity, "signer"), text(identity, "file_name")) {
-            return format!("signer:{signer}|{}", file.to_lowercase());
+            if is_original_name(&file, text(identity, "original_name").as_deref()) {
+                return format!("signer:{signer}|{}", file.to_lowercase());
+            }
         }
     }
     path_key(path)
@@ -301,7 +388,17 @@ mod tests {
         let path = "C:/Apps/Demo.EXE";
         let key = |identity: Value| identity_key(path, Some(&identity));
         assert_eq!(key(json!({ "signed": false, "signer": null, "file_name": "demo.exe", "package_family_name": "Contoso.Demo_abc" })), "package:contoso.demo_abc");
-        assert_eq!(key(json!({ "signed": true, "signer": "C=US, O=Contoso, CN=Contoso", "file_name": "Demo.EXE" })), "signer:C=US, O=Contoso, CN=Contoso|demo.exe", "the signer as it is, the file name lowercase");
+        assert_eq!(
+            key(json!({ "signed": true, "signer": "C=US, O=Contoso, CN=Contoso", "file_name": "Demo.EXE", "original_name": "demo.exe" })),
+            "signer:C=US, O=Contoso, CN=Contoso|demo.exe",
+            "the signer as it is, the file name lowercase"
+        );
+        assert_eq!(key(json!({ "signed": true, "signer": "CN=A", "file_name": "demo.exe", "original_name": "demo" })), "signer:CN=A|demo.exe", "compared without .exe");
+        // A signed file that is not the program its version resource names (a renamed copy), or that names none, is known by its path.
+        assert_eq!(key(json!({ "signed": true, "signer": "CN=A", "file_name": "demo.exe", "original_name": "cmd.exe" })), "c:\\apps\\demo.exe");
+        assert_eq!(key(json!({ "signed": true, "signer": "CN=A", "file_name": "demo.exe", "original_name": null })), "c:\\apps\\demo.exe");
+        assert_eq!(key(json!({ "signed": true, "signer": "CN=A", "file_name": "demo.exe" })), "c:\\apps\\demo.exe");
+        assert_eq!(key(json!({ "signed": true, "signer": "CN=A", "file_name": "demo.exe", "original_name": "" })), "c:\\apps\\demo.exe");
         assert_eq!(key(json!({ "signed": false, "signer": null, "file_name": "demo.exe" })), "c:\\apps\\demo.exe", "unsigned: the path");
         assert_eq!(identity_key(path, None), "c:\\apps\\demo.exe", "no identity: the path, as the server falls back");
         // An answer the server would not read is no identity.
@@ -312,5 +409,31 @@ mod tests {
         assert_eq!(key(json!({ "signed": false, "file_name": "demo.exe", "package_family_name": null })), "c:\\apps\\demo.exe");
         assert_eq!(key(json!({ "signed": true, "signer": "CN=A", "file_name": "demo.exe", "package_family_name": "" })), "c:\\apps\\demo.exe");
         assert_eq!(key(json!("signer:CN=A|demo.exe")), "c:\\apps\\demo.exe");
+    }
+
+    #[test]
+    fn an_original_name_is_its_last_part_lowercase_without_mui() {
+        assert_eq!(normalized_original_name("Cmd.Exe.MUI").as_deref(), Some("cmd.exe"));
+        assert_eq!(normalized_original_name(" NOTEPAD.EXE ").as_deref(), Some("notepad.exe"));
+        assert_eq!(normalized_original_name(r"C:\build\out\Tool.exe").as_deref(), Some("tool.exe"));
+        assert_eq!(normalized_original_name("Code").as_deref(), Some("code"));
+        for empty in ["", "   ", ".mui", r"C:\out\"] {
+            assert_eq!(normalized_original_name(empty), None, "{empty:?}");
+        }
+        assert!(is_original_name("notepad.exe", Some("notepad.exe")));
+        assert!(is_original_name("Code.exe", Some("code")));
+        assert!(!is_original_name("notepad.exe", Some("cmd.exe")));
+        assert!(!is_original_name("tool.exe", Some("cmd.exe")));
+        assert!(!is_original_name("notepad.exe", None));
+    }
+
+    #[test]
+    fn a_signed_electron_app_is_known_by_its_signer() {
+        assert!(is_original_name("code.exe", Some("electron.exe")));
+        assert!(is_original_name("Slack.exe", Some("Electron")));
+        assert!(!is_original_name("code.exe", Some("electron-helper.exe")));
+        assert!(!is_original_name("code.exe", Some("notelectron.exe")));
+        let identity = json!({ "signed": true, "signer": "CN=A", "file_name": "Code.exe", "original_name": "electron.exe" });
+        assert_eq!(identity_key("C:/Apps/Code.exe", Some(&identity)), "signer:CN=A|code.exe");
     }
 }
