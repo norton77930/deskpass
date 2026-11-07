@@ -201,6 +201,12 @@ thread_local! {
     /// `--ui-read-only` (ticket 64): the fixture also has a read-only edit holding
     /// `READ_ONLY_TEXT`, see `create_read_only`.
     static UI_READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `--ui-text` (reference-gaps G4, with `--ui-content`): the fixture also has a Rich Edit holding
+    /// `UI_TEXT` with `UI_TEXT_SELECTION` selected, see `create_ui_text`.
+    static UI_TEXT_BOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `--ui-text-long <segments>` (ticket 08, with `--ui-text`): how many segments of `long_ui_text`
+    /// that Rich Edit holds instead of `UI_TEXT`; 0 without the flag.
+    static UI_TEXT_LONG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// `--ui-scroll-tree` (ticket 65, with `--ui-content`): the fixture also has a tree view whose
     /// fifth item shows only its top half, see `create_scroll_tree`.
     static UI_SCROLL_TREE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -211,6 +217,12 @@ thread_local! {
     /// the edit, as an editor does, so every key typed while it is in front lands in the edit
     /// (its `len=` counts them). Without it, activation focuses the window itself.
     static EDIT_KEEPS_FOCUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `--list-ignores-wheel` (reference-gaps G5, with `--ui-content`): the list box swallows
+    /// WM_MOUSEWHEEL and WM_MOUSEHWHEEL, like an app (Edge) that ignores a posted wheel message
+    /// while its UI Automation ScrollPattern still scrolls it.
+    static LIST_IGNORES_WHEEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The list box's own window procedure, which `list_subclass` passes messages on to.
+    static LIST_PROC: std::cell::Cell<WNDPROC> = const { std::cell::Cell::new(None) };
 }
 
 /// The text of the `--ui-controls` password box, which must never appear in a UI tree.
@@ -641,8 +653,11 @@ fn main() {
         UI_SECTION.with(|section| section.set(ui_section));
         UI_READ_ONLY.with(|read_only| read_only.set(std::env::args().any(|arg| arg == "--ui-read-only")));
         UI_SCROLL_TREE.with(|tree| tree.set(std::env::args().any(|arg| arg == "--ui-scroll-tree")));
+        UI_TEXT_BOX.with(|text| text.set(std::env::args().any(|arg| arg == "--ui-text")));
+        UI_TEXT_LONG.with(|long| long.set(std::env::args().skip_while(|arg| arg != "--ui-text-long").nth(1).and_then(|value| value.parse().ok()).unwrap_or(0)));
         PASTE_AREA.with(|area| area.set(std::env::args().any(|arg| arg == "--paste-area")));
         EDIT_KEEPS_FOCUS.with(|keeps| keeps.set(std::env::args().any(|arg| arg == "--edit-keeps-focus")));
+        LIST_IGNORES_WHEEL.with(|ignores| ignores.set(std::env::args().any(|arg| arg == "--list-ignores-wheel")));
         if ui_section {
             register_class(instance, w!("CUMCP_SECTION"), Some(section_proc));
         }
@@ -1572,6 +1587,9 @@ unsafe extern "system" fn fixture_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             if UI_SCROLL_TREE.with(|tree| tree.get()) {
                 create_scroll_tree(hwnd, instance);
             }
+            if UI_TEXT_BOX.with(|text| text.get()) {
+                create_ui_text(hwnd, instance);
+            }
             if millis_arg("--hang-on-clipboard-update") > 0 {
                 let _ = AddClipboardFormatListener(hwnd);
             }
@@ -1796,6 +1814,49 @@ unsafe fn create_read_only(hwnd: HWND, instance: windows::Win32::Foundation::HMO
 }
 
 const ES_MULTILINE: u32 = 0x4;
+
+/// The text of the `--ui-text` Rich Edit: a code point outside the Basic Multilingual Plane (two
+/// UTF-16 units), so a cut inside a character can be told from one between characters.
+const UI_TEXT: &str = "ab\u{1F600}cd needle xyz";
+/// What is selected in it (UTF-16 units, `EM_SETSEL`): the emoji and "cd". The tests hold both
+/// texts as literals.
+const UI_TEXT_SELECTION: (usize, usize) = (2, 6);
+const UI_TEXT_ID: isize = 1700;
+const EM_SETSEL: u32 = 0x00B1;
+const EM_EXLIMITTEXT: u32 = 0x0435;
+
+/// The text of `--ui-text-long <segments>` (ticket 08): "x", then per segment three emoji and its
+/// number, 7 code points and 10 UTF-16 units. So pieces of 20,000 characters end among the emoji
+/// from the second on, and the 2 * (offset + max_chars) + 2 units the helper asks for end inside a
+/// pair. `helper/tests/read_text.rs` holds the same rule.
+fn long_ui_text(segments: usize) -> String {
+    let mut text = String::from("x");
+    for number in 0..segments {
+        text.push_str(&format!("\u{1F600}\u{1F600}\u{1F600}{:04}", number % 10_000));
+    }
+    text
+}
+
+/// `--ui-text` (reference-gaps G4, with `--ui-content`): a multi-line Rich Edit (UI Automation
+/// shows a Document with a text pattern) at client (490, 230), 200x80, holding `UI_TEXT` with
+/// `UI_TEXT_SELECTION` selected, to the right of the other controls. It does not take the focus.
+/// With `--ui-text-long <segments>` (ticket 08) it holds `long_ui_text` instead.
+unsafe fn create_ui_text(hwnd: HWND, instance: windows::Win32::Foundation::HMODULE) {
+    // The Rich Edit class (RICHEDIT50W) lives in this library.
+    let _ = LoadLibraryW(w!("Msftedit.dll"));
+    let style = WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_MULTILINE);
+    let rich = child(hwnd, instance, w!("RICHEDIT50W"), w!(""), style, 490, 230, 200, 80, UI_TEXT_ID);
+    match UI_TEXT_LONG.with(|long| long.get()) {
+        0 => set_text(rich, UI_TEXT),
+        segments => {
+            // A Rich Edit keeps 32,767 units unless told otherwise.
+            SendMessageW(rich, EM_EXLIMITTEXT, Some(WPARAM(0)), Some(LPARAM(0x7FFF_FFFE)));
+            set_text(rich, &long_ui_text(segments));
+        }
+    }
+    SendMessageW(rich, EM_SETSEL, Some(WPARAM(UI_TEXT_SELECTION.0)), Some(LPARAM(UI_TEXT_SELECTION.1 as isize)));
+}
+
 const WEB_TIMER_ID: usize = 71;
 const WEB_DOCUMENT_ID: isize = 1500;
 const WEB_CONTENT_ID: isize = 1510;
@@ -1886,7 +1947,8 @@ extern "system" {
 /// `--ui-content` (ticket 60): right of the 480 pixels the fixture has without it (client pixels):
 /// - a disabled button "Disabled" at (490, 10), 100x28;
 /// - a label "Colour:" and a drop-down list combo box at (655, 10), 130 wide, with Red, Green and
-///   Blue, Red chosen;
+///   Blue, Red chosen (with `--ui-long-colours`, also "Shade 1".. "Shade 30", so that its opened
+///   list scrolls; that list lies over the right end of the list box below);
 /// - a list box at (490, 50), 200x92 with a border, of `LIST_ROWS` rows "Row 1".. 20 pixels high:
 ///   rows 1 to 4 are whole, row 5 shows its top 10 pixels, and rows 6 on are scrolled out of it;
 /// - a tree view at (700, 50), 250x120: "Fruits" expanded (Apple, Banana), "Vegetables"
@@ -1906,9 +1968,18 @@ unsafe fn create_ui_content(hwnd: HWND, instance: windows::Win32::Foundation::HM
         let label: Vec<u16> = colour.encode_utf16().chain(Some(0)).collect();
         SendMessageW(combo, CB_ADDSTRING, None, Some(LPARAM(label.as_ptr() as isize)));
     }
+    if std::env::args().any(|arg| arg == "--ui-long-colours") {
+        for shade in 1..=30 {
+            let label: Vec<u16> = format!("Shade {shade}").encode_utf16().chain(Some(0)).collect();
+            SendMessageW(combo, CB_ADDSTRING, None, Some(LPARAM(label.as_ptr() as isize)));
+        }
+    }
     SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
     let list_style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_TABSTOP | WINDOW_STYLE(LBS_NOTIFY | LBS_NOINTEGRALHEIGHT);
     let list = child(hwnd, instance, w!("ListBox"), w!(""), list_style, 490, 50, 200, 92, 1104);
+    if LIST_IGNORES_WHEEL.with(|ignores| ignores.get()) {
+        LIST_PROC.with(|proc| proc.set(subclass(list, list_subclass)));
+    }
     SendMessageW(list, LB_SETITEMHEIGHT, Some(WPARAM(0)), Some(LPARAM(LIST_ROW_HEIGHT as isize)));
     for row in 1..=LIST_ROWS {
         let label: Vec<u16> = format!("Row {row}").encode_utf16().chain(Some(0)).collect();
@@ -1964,6 +2035,14 @@ unsafe fn create_ui_content(hwnd: HWND, instance: windows::Win32::Foundation::HM
             SendMessageW(tiny, LB_ADDSTRING, None, Some(LPARAM(label.as_ptr() as isize)));
         }
     }
+}
+
+/// `--list-ignores-wheel`: the list box's procedure; the wheel messages are taken and dropped.
+unsafe extern "system" fn list_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+        return LRESULT(0);
+    }
+    CallWindowProcW(LIST_PROC.with(|proc| proc.get()), hwnd, msg, wparam, lparam)
 }
 
 const TVM_SETITEMHEIGHT: u32 = 0x111B;

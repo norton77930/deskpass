@@ -152,14 +152,14 @@ test("the log never holds typed or pasted text, the keys pressed, or the window 
     for (const call of [
       { name: "computer_type_text", arguments: { window_id: "5", text: typedSecret } },
       { name: "computer_paste_text", arguments: { window_id: "5", text: pastedSecret } },
-      { name: "computer_press_key", arguments: { window_id: "5", key: "ctrl+alt+F11" } },
+      { name: "computer_press_key", arguments: { window_id: "5", key: "ctrl+shift+F11" } },
     ]) {
       const result = await harness.client.callTool(call);
       assert.notEqual(result.isError, true, call.name);
     }
     const text = await allLogText(logDir);
     assert.equal((await logLines(logDir)).length, 3);
-    for (const secret of [typedSecret, pastedSecret, "F11", "ctrl+alt", TITLE]) {
+    for (const secret of [typedSecret, pastedSecret, "F11", "f11", "ctrl+shift", TITLE]) {
       assert.equal(text.includes(secret), false, `the log holds ${secret}`);
     }
   });

@@ -200,6 +200,8 @@ enum Kind {
     Continue,
     /// Ticket 97: whether the AI may read the clipboard's text this session; "Deny / Allow once" only.
     ReadClipboard,
+    /// Reference-gaps G1: whether the AI may press a dangerous key combination in this app this session; "Deny / Allow once" only.
+    SystemKey { name: String, path: String, combination: String },
     /// Ticket 114: `confirm_change`, a loosening the settings page asks for: "Cancel / Allow".
     ConfirmChange { name: String, current: String, restored: String },
 }
@@ -277,10 +279,15 @@ fn parse(params: &Value) -> Result<Question, String> {
                 Some(value) => value.as_bool().ok_or("allow_always must be true or false.")?,
             },
         },
-        Some("continue" | "read_clipboard") if params.get("allow_always").is_some() => return Err("allow_always is only for kind approve_app.".to_string()),
+        Some("continue" | "read_clipboard" | "system_key") if params.get("allow_always").is_some() => return Err("allow_always is only for kind approve_app.".to_string()),
         Some("continue") => Kind::Continue,
         Some("read_clipboard") => Kind::ReadClipboard,
-        _ => return Err("kind must be approve_app, continue or read_clipboard.".to_string()),
+        Some("system_key") => Kind::SystemKey {
+            name: text("app_name").ok_or("app_name is required for kind system_key.")?,
+            path: text("app_path").ok_or("app_path is required for kind system_key.")?,
+            combination: text("combination").ok_or("combination is required for kind system_key.")?,
+        },
+        _ => return Err("kind must be approve_app, continue, read_clipboard or system_key.".to_string()),
     };
     Ok(Question { kind, timeout: parse_timeout(params)? })
 }
@@ -428,6 +435,13 @@ unsafe fn show(question: &Question, given_up: Arc<AtomicBool>) -> Result<Answer,
         Kind::ReadClipboard => (
             strings::text(strings::CLIPBOARD_TITLE),
             strings::filled(strings::CLIPBOARD_BODY, &[("seconds", &seconds)]),
+            strings::text(strings::BUTTON_ALLOW_ONCE),
+            strings::text(strings::BUTTON_DENY),
+            false,
+        ),
+        Kind::SystemKey { name, path, combination } => (
+            strings::text(strings::SYSTEM_KEY_TITLE),
+            strings::filled(strings::SYSTEM_KEY_BODY, &[("combination", combination), ("name", name), ("path", path), ("seconds", &seconds)]),
             strings::text(strings::BUTTON_ALLOW_ONCE),
             strings::text(strings::BUTTON_DENY),
             false,
@@ -781,4 +795,44 @@ unsafe fn measure(text: &str, font: Option<HFONT>, width: i32) -> i32 {
 
 pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn system_key() -> Value {
+        json!({ "kind": "system_key", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "combination": "alt+f4", "timeout_ms": 5_000 })
+    }
+
+    /// Reference-gaps G1: the question carries its app and combination, shown as given.
+    #[test]
+    fn a_system_key_question_is_parsed_with_its_app_and_combination() {
+        let question = parse(&system_key()).expect("parsed");
+        let Kind::SystemKey { name, path, combination } = question.kind else { panic!("not a system key question") };
+        assert_eq!((name.as_str(), path.as_str(), combination.as_str()), ("Demo", "C:\\Apps\\demo.exe", "alt+f4"));
+        assert_eq!(question.timeout, Duration::from_millis(5_000));
+    }
+
+    /// Reference-gaps G1: without its app or combination there is nothing the user could consent
+    /// to, and no parameter can offer "Always allow" on it.
+    #[test]
+    fn a_system_key_question_refuses_what_it_cannot_ask() {
+        for (name, value) in [("app_name", json!("")), ("app_path", json!(" ")), ("combination", json!("")), ("combination", json!(5)), ("timeout_ms", json!(1))] {
+            let mut params = system_key();
+            params[name] = value;
+            let message = parse(&params).err().unwrap_or_else(|| panic!("{params} was parsed"));
+            assert!(message.contains(name), "{params}: the error does not name {name}: {message}");
+        }
+        for name in ["app_name", "app_path", "combination", "timeout_ms"] {
+            let mut params = system_key();
+            params.as_object_mut().expect("object").remove(name);
+            let message = parse(&params).err().unwrap_or_else(|| panic!("{params} was parsed"));
+            assert!(message.contains(name), "{params}: the error does not name {name}: {message}");
+        }
+        let mut params = system_key();
+        params["allow_always"] = json!(false);
+        let message = parse(&params).err().expect("allow_always refused");
+        assert!(message.contains("allow_always"), "{message}");
+    }
 }

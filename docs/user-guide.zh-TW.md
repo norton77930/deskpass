@@ -44,7 +44,7 @@ Deskpass 不會記下你或 AI 輸入的文字、剪貼簿內容或截圖。
 
 步驟:
 
-1. 到 Deskpass 的 GitHub Releases 頁面(https://github.com/norton77930/deskpass/releases)下載 `deskpass-0.1.0.zip`(0.1.0 是版本號,新版的檔名會換成新的版本號)。建議先照「未簽章的 helper 與 SHA-256」核對雜湊值。然後在 zip 上按右鍵 →「全部解壓縮」,解壓縮到任何一個資料夾。
+1. 到 Deskpass 的 GitHub Releases 頁面(https://github.com/norton77930/deskpass/releases)下載 `deskpass-0.2.0.zip`(0.2.0 是版本號,新版的檔名會換成新的版本號)。建議先照「未簽章的 helper 與 SHA-256」核對雜湊值。然後在 zip 上按右鍵 →「全部解壓縮」,解壓縮到任何一個資料夾。
 2. 打開解壓縮出來的資料夾,確認裡面有 `install.ps1`、`uninstall.ps1`、`README.md`、`VERSION`、`deskpass-settings.vbs`、`package.json`,以及 `dist` 資料夾(裡面是 `index.js`、`deskpass-helper.exe`、`helper-build.json`)。整個安裝包只有十個左右的檔案,安裝幾秒就完成。
 3. 在這個資料夾的網址列(上方顯示路徑的地方)點一下,輸入 `powershell` 按 Enter,會開出一個位置就在這個資料夾的 PowerShell 視窗。在裡面執行:
 
@@ -340,10 +340,10 @@ Deskpass 附帶一支 Rust 寫的 helper(`dist\deskpass-helper.exe`),真正的�
 因為沒有簽章,請用雜湊值確認你拿到的 zip 沒有被換過。每個版本的 GitHub Release 說明裡都附有 zip 的 SHA-256。在 PowerShell 執行(把檔名換成你下載的):
 
 ```powershell
-Get-FileHash .\deskpass-0.1.0.zip -Algorithm SHA256
+Get-FileHash .\deskpass-0.2.0.zip -Algorithm SHA256
 ```
 
-輸出的 `Hash` 欄位要和 Release 說明裡的 SHA-256 完全相同(十六進位字母大小寫不影響)。不相同就不要安裝,請重新下載,還是不同就回報(見 [SECURITY](../SECURITY.md))。雜湊值只證明檔案和發布者放上去的一樣;要連發布者都不用信任,可以自己照 [開發文件](development.md) 的「Build」和「Packaging」從原始碼建置、打包。
+輸出的 `Hash` 欄位要和 Release 說明裡的 SHA-256 完全相同(十六進位字母大小寫不影響)。不相同就不要安裝,請重新下載,還是不同就回報(見 [SECURITY](../SECURITY.md))。雜湊值只證明檔案和發布者放上去的一樣。zip 是 GitHub 的 Release workflow 從打了 tag 的原始碼建置的,並附有簽署過的建置來源證明;裝了 [GitHub CLI](https://cli.github.com/) 可以執行 `gh attestation verify deskpass-0.2.0.zip --repo norton77930/deskpass`,確認 zip 是哪一個 commit、由哪個 workflow 建置的。要連 GitHub 的建置都不用信任,可以自己照 [開發文件](development.md) 的「Build」和「Packaging」從原始碼建置、打包。
 
 ## SmartScreen 或公司資安擋下時怎麼辦
 

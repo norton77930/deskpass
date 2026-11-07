@@ -56,7 +56,7 @@ test("computer_list_windows shows owner_window_id for an owned dialog only", asy
     assert.notEqual(result.isError, true);
     const [ownerBlock, dialogBlock] = textContent(result).split(/\r?\n\r?\n/);
     assert.match(dialogBlock ?? "", /window_id: 9/);
-    assert.match(dialogBlock ?? "", /title: Save As/);
+    assert.match(dialogBlock ?? "", /title: "Save As"/);
     assert.match(dialogBlock ?? "", /owner_window_id: 5/);
     assert.match(ownerBlock ?? "", /window_id: 5/);
     assert.doesNotMatch(ownerBlock ?? "", /owner_window_id/);

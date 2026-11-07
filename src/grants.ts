@@ -453,12 +453,13 @@ export class GrantView {
   /**
    * The tier `key` is treated in (`effectiveTier`): its built-in tier, or the user's raise when that
    * is stricter. A raise that is not (a request to lower a built-in tier, or one equal to it) is
-   * ignored and logged once per reading of the file.
+   * ignored and logged once per reading of the file. A raise under `priorKey` (`priorSignerKey`, the
+   * key the app had before the original-name rule) counts too.
    */
-  async tierFor(key: string, builtIn: TierMatch): Promise<TierMatch> {
+  async tierFor(key: string, builtIn: TierMatch, priorKey?: string | null): Promise<TierMatch> {
     let raised: Tier | null = null;
     for (const entry of this.loaded.effectiveRaised) {
-      if (entry.key !== key) continue;
+      if (entry.key !== key && entry.key !== priorKey) continue;
       const tier = entry.tier as Tier;
       if (raised === null || TIER_RANK[tier] > TIER_RANK[raised]) raised = tier;
     }

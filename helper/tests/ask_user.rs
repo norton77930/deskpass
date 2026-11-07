@@ -147,7 +147,7 @@ fn the_always_allow_button_is_shown_only_when_asked_for_and_answers_allow_always
     for params in [approve(false), json!({ "kind": "approve_app", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "timeout_ms": 30_000 })] {
         let asked = helper.send("ask_user", params.clone());
         let dialog = wait_for_dialog(helper.pid());
-        assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "永遠允許 shown though not asked for: {params}");
+        assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "Always allow shown though not asked for: {params}");
         assert_eq!(button_text(dialog, ALLOW_ID), "本次允許");
         answer(helper.pid(), "deny");
         assert_eq!(helper.wait(asked, Duration::from_secs(5))["result"]["answer"], "deny");
@@ -194,7 +194,7 @@ fn the_clipboard_question_has_two_buttons_and_refuses_by_default() {
     let asked = helper.send("ask_user", question.clone());
     let dialog = wait_for_dialog(helper.pid());
     assert!(dialog_text(dialog).contains("剪貼簿"), "the question does not name the clipboard: {:?}", dialog_text(dialog));
-    assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "永遠允許 shown on the clipboard question");
+    assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "Always allow shown on the clipboard question");
     assert_eq!(button_text(dialog, ALLOW_ID), "本次允許");
     assert_eq!(button_text(dialog, DENY_ID), "拒絕");
     let pressed = answer(helper.pid(), "enter");
@@ -212,7 +212,52 @@ fn the_clipboard_question_has_two_buttons_and_refuses_by_default() {
     let early = answerer.result();
     assert_eq!(early["allow_enabled"], false, "the click was not early enough to test the arming delay: {early}");
     wait_until_armed(dialog);
-    assert_unanswered(&mut helper, asked, dialog, "an early click on 本次允許");
+    assert_unanswered(&mut helper, asked, dialog, "an early click on Allow once");
+    answer(helper.pid(), "allow");
+    let response = helper.wait(asked, Duration::from_secs(5));
+    assert_eq!(response["result"]["answer"], "allow", "{response}");
+    assert!(!unsafe { IsWindow(Some(dialog)) }.as_bool(), "the answered dialog is still open");
+}
+
+/// Reference-gaps G1: the key combination question (kind `system_key`) has two buttons only, "Deny"
+/// and "Allow once", never "Always allow"; it names the combination and the app. The refusal is the
+/// default with the focus (Enter refuses), Alt+F4 refuses, an early click on "Allow once" does not
+/// allow, and a click once it is armed answers `allow`.
+#[test]
+fn the_system_key_question_has_two_buttons_and_names_the_combination_and_app() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let mut helper = Helper::spawn();
+    let question = json!({ "kind": "system_key", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "combination": "alt+f4", "timeout_ms": 30_000 });
+
+    let asked = helper.send("ask_user", question.clone());
+    let dialog = wait_for_dialog(helper.pid());
+    let text = dialog_text(dialog);
+    for named in ["alt+f4", "Demo", "C:\\Apps\\demo.exe", "組合鍵"] {
+        assert!(text.contains(named), "the question does not name {named}: {text:?}");
+    }
+    assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "Always allow shown on the key combination question");
+    assert_eq!(button_text(dialog, ALLOW_ID), "本次允許");
+    assert_eq!(button_text(dialog, DENY_ID), "拒絕");
+    let pressed = answer(helper.pid(), "enter");
+    assert_eq!(pressed["foreground"], true, "{pressed}");
+    assert_eq!(helper.wait(asked, Duration::from_secs(5))["result"]["answer"], "deny", "Enter alone must refuse");
+
+    let asked = helper.send("ask_user", question.clone());
+    wait_for_dialog(helper.pid());
+    answer(helper.pid(), "alt-f4");
+    assert_eq!(helper.wait(asked, Duration::from_secs(5))["result"]["answer"], "deny", "closing the key combination question must refuse");
+
+    let mut answerer = WaitingAnswerer::start(helper.pid(), "allow-early");
+    let asked = helper.send("ask_user", question.clone());
+    let dialog = wait_for_dialog(helper.pid());
+    let early = answerer.result();
+    assert_eq!(early["allow_enabled"], false, "the click was not early enough to test the arming delay: {early}");
+    wait_until_armed(dialog);
+    assert_unanswered(&mut helper, asked, dialog, "an early click on Allow once");
     answer(helper.pid(), "allow");
     let response = helper.wait(asked, Duration::from_secs(5));
     assert_eq!(response["result"]["answer"], "allow", "{response}");
@@ -238,7 +283,7 @@ fn a_click_on_always_allow_right_after_the_dialog_appears_does_not_allow() {
     let early = answerer.result();
     assert_eq!(early["always_enabled"], false, "the click was not early enough to test the arming delay: {early}");
     wait_until_armed(dialog);
-    assert_unanswered(&mut helper, asked, dialog, "an early click on 永遠允許");
+    assert_unanswered(&mut helper, asked, dialog, "an early click on Always allow");
 
     answer(helper.pid(), "deny");
     let response = helper.wait(asked, Duration::from_secs(5));
@@ -439,10 +484,10 @@ fn a_click_notification_for_always_allow_on_a_two_button_dialog_does_nothing() {
     let asked = helper.send("ask_user", json!({ "kind": "approve_app", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "timeout_ms": 30_000 }));
     let dialog = wait_for_dialog(helper.pid());
     wait_until_armed(dialog);
-    assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "the dialog was offered 永遠允許");
+    assert!(unsafe { GetDlgItem(Some(dialog), ALWAYS_ID) }.is_err(), "the dialog was offered Always allow");
     // BN_CLICKED is 0, so the notification's wParam is the control id alone.
     unsafe { SendMessageW(dialog, WM_COMMAND, Some(WPARAM(ALWAYS_ID as usize)), Some(LPARAM(0))) };
-    assert_unanswered(&mut helper, asked, dialog, "永遠允許's click notification on a two-button dialog");
+    assert_unanswered(&mut helper, asked, dialog, "Always allow's click notification on a two-button dialog");
 
     answer(helper.pid(), "deny");
     let response = helper.wait(asked, Duration::from_secs(5));
@@ -799,6 +844,11 @@ fn ask_user_refuses_bad_parameters_without_a_dialog() {
         (json!({ "kind": "continue", "timeout_ms": 5_000, "allow_always": true }), "allow_always"),
         (json!({ "kind": "read_clipboard", "timeout_ms": 5_000, "allow_always": true }), "allow_always"),
         (json!({ "kind": "read_clipboard" }), "timeout_ms"),
+        (json!({ "kind": "system_key", "app_path": "C:\\Apps\\demo.exe", "combination": "alt+f4", "timeout_ms": 5_000 }), "app_name"),
+        (json!({ "kind": "system_key", "app_name": "Demo", "combination": "alt+f4", "timeout_ms": 5_000 }), "app_path"),
+        (json!({ "kind": "system_key", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "timeout_ms": 5_000 }), "combination"),
+        (json!({ "kind": "system_key", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "combination": "alt+f4" }), "timeout_ms"),
+        (json!({ "kind": "system_key", "app_name": "Demo", "app_path": "C:\\Apps\\demo.exe", "combination": "alt+f4", "timeout_ms": 5_000, "allow_always": true }), "allow_always"),
     ];
     for (params, named) in cases {
         let response = helper.request("ask_user", params.clone());

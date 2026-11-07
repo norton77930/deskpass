@@ -292,3 +292,15 @@ for (const { name, context, bounds, position } of scaleCases) {
 test("escapeAppText leaves ordinary text alone", () => {
   assert.equal(escapeAppText("儲存 Save (Ctrl+S) 100%"), "儲存 Save (Ctrl+S) 100%");
 });
+
+test("an app name is flattened to one line, without format characters, and cut", async () => {
+  const { flatAppName, APP_NAME_LIMIT } = await import("../src/tree-format.ts");
+  assert.equal(flatAppName("Note\npad\r\n\tPro"), "Note pad Pro");
+  assert.equal(flatAppName("Evil\u202Eexe.txt"), "Evilexe.txt", "a bidi override is dropped");
+  assert.equal(flatAppName("a\u200Bb\u2028c"), "ab c");
+  assert.equal(flatAppName("\uD800x"), "\uFFFDx");
+  const long = flatAppName("x".repeat(500));
+  assert.equal([...long].length, APP_NAME_LIMIT);
+  assert.ok(long.endsWith("…"));
+  assert.equal(flatAppName("   "), "");
+});

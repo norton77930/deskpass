@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
+import { SYSTEM_KEY_ENTRIES } from "../src/keys.ts";
 import { connectServer } from "./harness.ts";
 
 // Ticket 147: the descriptions of the tools with a delivery_mode say how to use background delivery
@@ -12,12 +13,13 @@ interface Listed {
   inputSchema: { properties?: Record<string, { description?: string; enum?: string[] }> };
 }
 
-const BACKGROUND_TOOLS = ["computer_click", "computer_element_action", "computer_set_value"];
-const FOREGROUND_ONLY_TOOLS = ["computer_type_text", "computer_press_key", "computer_scroll", "computer_drag", "computer_paste_text"];
+const BACKGROUND_TOOLS = ["computer_click", "computer_scroll", "computer_element_action", "computer_set_value"];
+const FOREGROUND_ONLY_TOOLS = ["computer_type_text", "computer_press_key", "computer_drag", "computer_paste_text"];
 
 /** The reasons a background_unavailable can carry, and the ones each background-capable tool can give. */
 const REASONS_OF: Record<string, string[]> = {
   computer_click: ["needs_pointer", "no_click_pattern", "no_element_at_point", "minimized"],
+  computer_scroll: ["no_scroll_pattern", "minimized"],
   computer_element_action: ["focus_needs_foreground", "minimized"],
   computer_set_value: ["minimized"],
 };
@@ -100,6 +102,29 @@ test("ticket 147: computer_batch says each step takes its tool's delivery_mode a
   assert.match(text, /delivery_mode/);
   assert.match(text, /background_unavailable/);
   assert.match(text, /stops the batch/i);
+});
+
+test("reference-gaps G1: computer_press_key says which combinations need the user's consent and to report a refusal, not retry", async () => {
+  const text = describe((await listed()).find((tool) => tool.name === "computer_press_key"));
+  assert.match(text, /Win key/);
+  for (const entry of SYSTEM_KEY_ENTRIES) assert.ok(text.includes(entry), `the description names ${entry}`);
+  assert.match(text, /consent in a Windows dialog/);
+  assert.match(text, /for that app and that combination, for this session/);
+  assert.match(text, /always allowed/);
+  for (const refusal of ["approval_declined", "approval_refused_earlier", "approval_unavailable"]) assert.ok(text.includes(refusal), refusal);
+  assert.match(text, /report that to the user instead of retrying/i);
+});
+
+test("reference-gaps G1: computer_click and computer_drag say that holding the Win key needs the same consent", async () => {
+  for (const name of ["computer_click", "computer_drag"]) {
+    const text = describe((await listed()).find((tool) => tool.name === name));
+    assert.match(text, /win in modifiers/, name);
+    assert.match(text, /consent in a Windows dialog/, name);
+    assert.match(text, /computer_press_key/, name);
+    for (const refusal of ["approval_declined", "approval_refused_earlier", "approval_unavailable"]) assert.ok(text.includes(refusal), `${name}: ${refusal}`);
+    assert.match(text, /report that to the user instead of retrying/i, name);
+  }
+  assert.match(describe((await listed()).find((tool) => tool.name === "computer_click")), /asked only in the foreground/, "the background refusal comes first, and shows no dialog");
 });
 
 test("ticket 147: the descriptions mention only tools, parameters, reasons and result fields that exist", async () => {

@@ -39,7 +39,7 @@ while the model works.
 | the window is resized after the screenshot | coordinates from the old image land somewhere else | an element action does not depend on coordinates; a coordinate from a screenshot taken before the resize is refused (`stale_screenshot`) and nothing is sent |
 | the model needs to know a control's state | it judges from pixels whether a box is ticked or a list is open | the tree reports value and states (on, off, expanded, focused, disabled), and actions read the new state back |
 | the model fills in a text field | text is typed key by key, at the app's pace, and an input method can compose or hold characters | `computer_set_value` writes the whole value through UI Automation and reads it back |
-| you keep working while the AI acts | every click needs the window in front and moves your cursor | button, checkbox, list and field actions run in the background; if the app grabs the foreground, it is given back at once, and an action that cannot run in the background is refused (`background_unavailable`) instead of quietly taking your screen |
+| you keep working while the AI acts | every click needs the window in front and moves your cursor | button, checkbox, list and field actions and scrolling run in the background; if the app grabs the foreground, it is given back at once, and an action that cannot run in the background is refused (`background_unavailable`) instead of quietly taking your screen |
 
 The screenshot is still there: `computer_screenshot` and `computer_zoom` cover
 what the tree does not, such as web content and canvases.
@@ -55,8 +55,13 @@ tools.
 2. Check it against the SHA-256 in the release notes:
 
    ```powershell
-   Get-FileHash .\deskpass-0.1.0.zip -Algorithm SHA256
+   Get-FileHash .\deskpass-0.2.0.zip -Algorithm SHA256
    ```
+
+   Releases are built by the [Release workflow](.github/workflows/release.yml)
+   from the tagged source, with a signed build provenance. With the
+   [GitHub CLI](https://cli.github.com/) you can check that the zip is the one it
+   built: `gh attestation verify deskpass-0.2.0.zip --repo norton77930/deskpass`.
 
 3. Extract the zip, open PowerShell in the extracted folder and run:
 
@@ -107,14 +112,56 @@ dialog and the stop keys.
 - **UI tree first.** `computer_get_ui_tree` lists a window's controls with
   numbers; `computer_click` with `element_index`, `computer_element_action` and
   `computer_set_value` act on them. Screenshots are scaled to the model's image
-  budget and coordinates are mapped back.
-- **Background delivery.** Element actions run through UI Automation without
-  bringing the window forward. Before each one Deskpass waits until your keyboard
+  budget and coordinates are mapped back. To read less of a large app, the AI can
+  pass `max_depth` (1 to 30 levels; children below are counted as omitted) and/or
+  `interactive_only` (only numbered elements that can do more than be scrolled into view,
+  and the lines above them), alone or
+  with `query`. To focus on one pane, `root_element_index` (with an optional
+  `tree_id`, default the window's latest tree) reads only the subtree under that
+  element, which counts as level 0 for `max_depth`; the window's popups are left
+  out. Such a tree begins with a line saying it is not the whole tree (and, for a
+  subtree, which element it is the subtree of); its numbers work like those of
+  any other tree.
+- **Reading text.** `computer_read_text` reads the text of one element of a UI
+  tree instead of the AI reading it off a screenshot: the text you have
+  selected in it (`scope: selection`) or all of its text (`scope: document`, the
+  default), at most `max_chars` characters (default and most 20,000; longer text
+  is cut there and the answer says `more: true`, and the AI reads on from there
+  with `offset`, piece by piece, until `more` is false). It is approved like a
+  screenshot and takes no input: it does not touch your clipboard, the
+  foreground window, the mouse pointer or your selection. A password field is
+  refused before anything is read, an element with no text to read says so, and
+  an app that does not answer within 3 seconds gives no text at all (each piece
+  has its own 3 seconds, and a later piece of a very long document takes longer
+  than an earlier one, because the text is read from its start). The text
+  comes back in a block of its own, marked as app content and not as your
+  instructions. The action log records the app, the scope and how many characters
+  were read, never the text.
+- **Waiting for a window or an element.** `computer_wait_for` waits until a
+  window with some text in its title appears, or until a window closes, or until
+  an element whose name or value holds some text appears or goes away (a "Loading"
+  label, say), for up to 30 seconds. Waiting for a window only reads the window
+  list, so it needs no approval. Waiting for an element is approved like reading
+  the UI tree: the app must be allowed and Deskpass takes its lock. Either way it
+  sends no input and does not touch the foreground, and the UI tree the AI
+  already holds stays valid while it waits. If the time runs out it says so, and
+  nothing else has happened.
+- **Background delivery.** Element actions, and scrolling, run through UI Automation without
+  bringing the window forward or moving your mouse pointer. Before each one Deskpass waits until your keyboard
   has been idle for 0.3 seconds (at most 3 seconds); if the app takes the
   foreground anyway, it is handed back to your window right away.
 - **Stop keys.** A physical Ctrl+Alt+Esc stops the AI at any time; a single Esc
   stops it while it works in the foreground. Keys the AI sends itself never
   count. After a stop, Deskpass asks you before the AI may continue.
+- **Consent for keys that reach beyond the app.** Approving an app, even with
+  "Always allow", does not cover key combinations that act outside it: anything
+  with the Win key, `alt+f4`, `ctrl+alt+delete`, `alt+tab`, `ctrl+alt+tab`,
+  `alt+escape`, `ctrl+escape`, `ctrl+shift+escape`, `ctrl+alt+escape`, `alt+f8`
+  and `alt+f11`, also with more keys held. `computer_press_key` sends them only
+  after you allow that combination for that app in Deskpass's own Windows dialog.
+  A click or a drag holding the Win key needs the same consent, and shares the
+  answer. The answer lasts until the MCP server restarts and is never written to
+  disk, and each question and answer is logged with the app and the combination.
 - **Logs without content.** The log records each action and the app it was on,
   never typed text, clipboard contents or screenshots.
 
@@ -218,7 +265,10 @@ Reproducible numbers only; no speed or success-rate benchmarks.
   elevates itself.
 - Unsigned apps are recognised by their path: if one moves, or later ships
   signed, the choices you made for it (for example blocking it) no longer apply,
-  and the log does not point this out.
+  and the log does not point this out. So is a signed app whose file name is not
+  the name in its version information (a renamed copy), or that has none: it can
+  only be allowed once. Signed Electron apps such as VS Code are the exception:
+  their version information names Electron, and they can still be always allowed.
 - The AI cannot type or paste into password fields and asks you to type instead,
   but a password field the app does not mark as one is not recognised.
 - Typing and key presses follow the app's pace, slower than pasting; long text is
@@ -231,6 +281,13 @@ Reproducible numbers only; no speed or success-rate benchmarks.
   - Not every app supports it. Web content and apps that draw their own surface
     (for example the Paint canvas) usually have no elements to act on, so the AI
     gets `background_unavailable` and may redo the action in the foreground.
+  - A background scroll scrolls the list or pane under the point with wheel
+    messages posted to the window there, or through UI Automation when those
+    move nothing, not with the real mouse wheel: one step is a small
+    increment, which need not be the distance of a wheel notch, so the AI checks
+    the result with a screenshot. Scrolling is background by default, which is a change from
+    earlier versions; where nothing under the point scrolls, the AI gets
+    `background_unavailable` and may redo it in the foreground.
   - A background click is a UI Automation action, not a real mouse click. A few
     apps react only to the real mouse: the action reports success but nothing
     changes. The AI checks with a screenshot.

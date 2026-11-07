@@ -48,9 +48,11 @@ fn the_dialogs_are_in_english() {
     let clipboard = json!({ "kind": "read_clipboard", "timeout_ms": 30_000 });
     let resume = json!({ "kind": "continue", "timeout_ms": 30_000 });
     let confirm = json!({ "app_name": APP, "current_state": "Blocked (set by you)", "restored_state": "Normal: ask every time", "timeout_ms": 30_000 });
-    let cases: [(&str, Value, PCWSTR, &str, &[&str], &str); 4] = [
+    let system_key = json!({ "kind": "system_key", "app_name": APP, "app_path": "C:\\Apps\\demo.exe", "combination": "alt+f4", "timeout_ms": 30_000 });
+    let cases: [(&str, Value, PCWSTR, &str, &[&str], &str); 5] = [
         ("ask_user", approve, ASK_CLASS, "Deskpass: Approve app", &["Allow once", "Always allow", "Deny"], "Allow the AI to operate this app?"),
         ("ask_user", clipboard, ASK_CLASS, "Deskpass: Read clipboard", &["Allow once", "Deny"], "read the text on your clipboard"),
+        ("ask_user", system_key, ASK_CLASS, "Deskpass: Allow key combination", &["Allow once", "Deny"], "press alt+f4 in this app"),
         ("ask_user", resume, ASK_CLASS, "Deskpass: Continue?", &["Continue", "Don't continue"], "You pressed Esc to stop Deskpass earlier. Let the AI continue?"),
         ("confirm_change", confirm, w!("DESKPASS_CONFIRM_CHANGE"), "Deskpass confirmation", &["Allow", "Cancel"], "The settings page asks to loosen a limit"),
     ];

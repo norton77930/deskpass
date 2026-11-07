@@ -37,7 +37,7 @@
 | 截圖之後視窗改了大小 | 舊圖上的座標會落到別的地方 | 元素動作不靠座標;來自改大小之前那張截圖的座標會被拒絕(`stale_screenshot`),什麼都不送 |
 | 模型要知道控制項的狀態 | 從像素判斷核取方塊有沒有勾、清單有沒有展開 | 樹會列出值與狀態(開、關、展開、焦點、停用),動作完成後讀回新狀態 |
 | 模型要在文字欄位填字 | 一個鍵一個鍵打,跟著 App 的速度,輸入法可能組字或卡住字 | `computer_set_value` 經 UI Automation 一次寫入整段值,並讀回確認 |
-| AI 做事時你繼續用電腦 | 每次點擊都要把視窗帶到前面,游標也被移走 | 按鈕、核取方塊、清單與欄位的動作在背景完成;App 搶走前景時立刻還給你,背景做不到的動作會被拒絕(`background_unavailable`),不會悄悄佔走你的畫面 |
+| AI 做事時你繼續用電腦 | 每次點擊都要把視窗帶到前面,游標也被移走 | 按鈕、核取方塊、清單與欄位的動作以及捲動都在背景完成;App 搶走前景時立刻還給你,背景做不到的動作會被拒絕(`background_unavailable`),不會悄悄佔走你的畫面 |
 
 截圖仍然在:`computer_screenshot` 與 `computer_zoom` 處理樹涵蓋不到的地方,例如網頁內容與畫布。
 
@@ -51,8 +51,13 @@
 2. 用 release 說明裡的 SHA-256 檢查它:
 
    ```powershell
-   Get-FileHash .\deskpass-0.1.0.zip -Algorithm SHA256
+   Get-FileHash .\deskpass-0.2.0.zip -Algorithm SHA256
    ```
+
+   Release 由 [Release workflow](.github/workflows/release.yml) 從打了 tag 的原始碼
+   建置,並附有簽署過的建置來源證明(build provenance)。裝了
+   [GitHub CLI](https://cli.github.com/) 的話,可以確認 zip 就是它建置的那一份:
+   `gh attestation verify deskpass-0.2.0.zip --repo norton77930/deskpass`。
 
 3. 解壓縮 zip,在解壓縮出來的資料夾開 PowerShell,執行:
 
@@ -93,11 +98,35 @@ Deskpass 分成兩個行程。Node.js 的 MCP server 負責所有政策判斷:�
   工作管理員與 UAC 視窗一律封鎖;瀏覽器、郵件、檔案總管與密碼管理工具每個 session 都要問。
 - **先讀 UI 樹。** `computer_get_ui_tree` 列出視窗的控制項並編號;帶 `element_index` 的
   `computer_click`、`computer_element_action` 與 `computer_set_value` 對它們動作。截圖會
-  縮到模型的影像預算內,座標再換算回去。
-- **背景操作。** 元素動作經 UI Automation 完成,不把視窗帶到前面。每個動作前,Deskpass
-  先等你的鍵盤停 0.3 秒(最多等 3 秒);App 還是搶走前景時,立刻還給你的視窗。
+  縮到模型的影像預算內,座標再換算回去。大型 App 可以少讀一點:AI 可以傳 `max_depth`
+  (1 到 30 層,更深的子元素算進省略數量)和 `interactive_only`(只留有編號、且不只能捲動到可見的元素與它們的
+  上層),兩者可單獨用,也可搭配 `query`。要專注在單一窗格時,`root_element_index`(可再帶
+  `tree_id`,預設是視窗最新的樹)只讀該元素底下的子樹,該元素算第 0 層,視窗的快顯視窗不會
+  納入。這類結果的開頭會說明這不是整棵樹(子樹還會說明是哪個元素的子樹),編號的用法和其他
+  樹相同。
+- **讀文字。** `computer_read_text` 直接讀 UI 樹裡某個元素的文字,AI 不必從截圖辨識:可以讀
+  你選取的文字(`scope: selection`)或全部文字(`scope: document`,預設),最多 `max_chars`
+  字(預設與上限都是 20,000)。更長的文字會在那裡切斷並回報 `more: true`,AI 用 `offset`
+  接著讀,一段一段讀到 `more` 為 false。核准方式與截圖相同,也不送任何輸入:不動你的剪貼簿、
+  前景視窗、滑鼠游標或選取範圍。密碼欄位在讀取之前就會被拒絕;元素沒有文字可讀時會如實說明;
+  App 在 3 秒內沒回應就不回傳任何文字(每一段各有 3 秒。文字都從開頭讀起,所以很長的文件越後面
+  的段落越慢)。文字放在獨立的區塊,標明是 App 內容、不是你的指令。操作紀錄只記 App、範圍與
+  字數,不記文字本身。
+- **等待視窗或元素。** `computer_wait_for` 最多等 30 秒,條件可以是標題含某段文字的視窗出現、
+  某個視窗關閉,或名稱或值含某段文字的元素出現或消失(例如「載入中」)。等視窗只讀視窗清單,
+  不需要核准。等元素的核准方式與讀 UI 樹相同:App 要獲准,Deskpass 也會取得它的鎖。兩者都
+  不送輸入、不動前景,AI 手上的 UI 樹在等待期間仍然有效。時間到了會如實說明,其他什麼都不會發生。
+- **背景操作。** 元素動作與捲動經 UI Automation 完成,不把視窗帶到前面,也不移動滑鼠游標。
+  每個動作前,Deskpass 先等你的鍵盤停 0.3 秒(最多等 3 秒);App 還是搶走前景時,立刻還給你的
+  視窗。
 - **停止鍵。** 實體的 Ctrl+Alt+Esc 任何時候都能停止 AI;AI 在前景操作時,單按 Esc 也可以。
   AI 自己送出的按鍵不算。停止之後,Deskpass 會先問你,AI 才能繼續。
+- **超出 App 範圍的按鍵要另外同意。** 核准 App(即使選「永遠允許」)不包含會影響 App 以外的
+  組合鍵:任何含 Win 鍵的組合、`alt+f4`、`ctrl+alt+delete`、`alt+tab`、`ctrl+alt+tab`、
+  `alt+escape`、`ctrl+escape`、`ctrl+shift+escape`、`ctrl+alt+escape`、`alt+f8` 與 `alt+f11`,
+  多按其他鍵也一樣。`computer_press_key` 要等你在 Deskpass 自己的 Windows 對話框裡,對該 App
+  允許該組合之後才會送出。按住 Win 鍵的點擊或拖曳需要同樣的同意,也共用同一個回答。回答只到
+  MCP server 重新啟動為止,不會寫入磁碟,每次詢問與回答都會記錄 App 與組合鍵。
 - **日誌不記內容。** 日誌記下每個動作與它操作的 App,不記輸入的文字、剪貼簿內容或截圖。
 
 設計說明、每個工具與技術限制見 [docs/development.md](docs/development.md)(英文)。
@@ -186,7 +215,9 @@ args = ["C:\\Users\\<you>\\AppData\\Local\\Programs\\Deskpass\\dist\\index.js"]
 - 只支援 Windows 10(2004 以上)與 Windows 11。
 - 不能操作以系統管理員身分執行的視窗,Deskpass 也不會替自己提升權限。
 - 沒有簽章的 App 是依路徑認出來的:程式搬了位置,或之後換成有簽章的版本,你對它做的
-  設定(例如封鎖)就不再套用,而且日誌不會提醒。
+  設定(例如封鎖)就不再套用,而且日誌不會提醒。有簽章但檔名和版本資訊裡的原始檔名不同
+  (改名的副本)、或沒有版本資訊的 App 也一樣,只能允許一次。有簽章的 Electron App(例如
+  VS Code)例外:它們的版本資訊寫的是 Electron,仍然可以永遠允許。
 - AI 不能在密碼欄打字或貼上,會請你自己輸入;但 App 沒有標示成密碼欄的欄位,Deskpass
   認不出來。
 - 打字與按鍵跟著 App 的速度,比貼上慢;長文字要分成多次。部分 Windows 內建的 UWP App
@@ -195,6 +226,9 @@ args = ["C:\\Users\\<you>\\AppData\\Local\\Programs\\Deskpass\\dist\\index.js"]
 - 背景操作:
   - 不是每個 App 都做得到。網頁內容與自己畫畫面的 App(例如小畫家的畫布)通常沒有可以
     動作的元素,AI 會收到 `background_unavailable`,可以改用前景重做。
+  - 背景捲動是對該點底下的視窗投遞滾輪訊息,沒有動靜時改用 UI Automation 捲動該點底下的清單或窗格,不是用真正的滑鼠滾輪:一步是一個小幅
+    增量,距離不一定等於滾輪一格,AI 會截圖確認。捲動預設走背景,這和先前版本不同;該點底下
+    沒有可捲動的東西時,AI 會收到 `background_unavailable`,可以改用前景重做。
   - 背景點擊是 UI Automation 動作,不是真的滑鼠點擊。少數 App 只認真的滑鼠:動作回報
     成功,畫面卻沒變。AI 會截圖確認。
   - 少數 App 的核取方塊,偶爾背景勾選沒有生效;結果會如實回報狀態沒變,AI 可以重做。

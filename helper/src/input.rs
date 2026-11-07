@@ -120,7 +120,7 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, LoadKeyboardLayoutW, SendInput, UnloadKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, KLF_NOTELLSHELL, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, KLF_NOTELLSHELL, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
     VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PACKET, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
@@ -286,6 +286,8 @@ pub(crate) enum BackgroundReason {
     NoElementAtPoint,
     FocusNeedsForeground,
     Minimized,
+    /// Reference-gaps G5: nothing at the point of a scroll can scroll that way (`uia::scroll_point`).
+    NoScrollPattern,
     #[allow(dead_code)]
     ToolNeedsForeground,
 }
@@ -298,6 +300,7 @@ impl BackgroundReason {
             BackgroundReason::NoElementAtPoint => "no_element_at_point",
             BackgroundReason::FocusNeedsForeground => "focus_needs_foreground",
             BackgroundReason::Minimized => "minimized",
+            BackgroundReason::NoScrollPattern => "no_scroll_pattern",
             BackgroundReason::ToolNeedsForeground => "tool_needs_foreground",
         }
     }
@@ -309,6 +312,7 @@ impl BackgroundReason {
             BackgroundReason::NoElementAtPoint => "No element that can be acted on was found at that point of the target window, so the click cannot be delivered in the background",
             BackgroundReason::FocusNeedsForeground => "Moving the keyboard focus brings the window forward, so focus cannot be delivered in the background",
             BackgroundReason::Minimized => "The target window is minimized, so the action cannot be delivered in the background",
+            BackgroundReason::NoScrollPattern => "Nothing at that point of the target window scrolls in that direction, so the scroll cannot be delivered in the background",
             BackgroundReason::ToolNeedsForeground => "This tool needs real keyboard or pointer input, so it cannot be delivered in the background",
         }
     }
@@ -605,6 +609,12 @@ pub fn scroll(params: &Value) -> Result<Value, Failure> {
         "left" => (MOUSEEVENTF_HWHEEL, -WHEEL_NOTCH),
         _ => return Err(("invalid_params".to_string(), "direction must be up, down, left, or right.".to_string()).into()),
     };
+    // Reference-gaps G5: a scroll delivered in the background goes through the ScrollPattern of the
+    // element at the point (`uia::scroll_point`), as a background click goes through a click pattern:
+    // no wheel, no cursor move, no activation. Without `delivery_mode` it is the wheel, as before.
+    if Delivery::from_params(params)? == Delivery::Background {
+        return crate::uia::scroll_point(params, x, y, direction, amount as u64);
+    }
     let (screen_x, screen_y) = point_in_window(hwnd, x, y)?;
     let _busy = InputBusy::enter();
     unsafe {
@@ -1992,6 +2002,8 @@ unsafe fn ensure_target_responds(hwnd: HWND) -> Result<(), String> {
 
 unsafe fn foreground(hwnd: HWND) -> Result<(), String> {
     ensure_target_responds(hwnd)?;
+    // A background action's watch kept for a late answer would take the foreground straight back.
+    crate::restore::end_late_watches(hwnd);
     // Already in front (itself or its dialog, as `ready_for_input` judges it): no key is sent, as
     // a stray ALT would put an app with a menu bar into menu mode. It may still lie under other
     // windows, so it is raised.
@@ -2098,14 +2110,13 @@ impl Stacking {
     }
 }
 
+/// One try at bringing `hwnd` in front: `FOREGROUND_STEPS` first with no `AttachThreadInput`, and
+/// only when they all left it behind, attached to the foreground and target threads for a second
+/// pass, detached right after (`run_foreground_passes`). The attach is the last resort because
+/// attaching while the user types loses their keys (deskpass #5, measured E20).
 unsafe fn attempt_foreground(hwnd: HWND) {
     let current = GetCurrentThreadId();
-    let foreground = GetForegroundWindow();
-    let foreground_thread = GetWindowThreadProcessId(foreground, None);
-    let target_thread = GetWindowThreadProcessId(hwnd, None);
-    let attached_foreground = foreground_thread != 0 && foreground_thread != current && AttachThreadInput(current, foreground_thread, true).0 != 0;
-    let attached_target = target_thread != 0 && target_thread != current && target_thread != foreground_thread && AttachThreadInput(current, target_thread, true).0 != 0;
-    run_foreground_steps(
+    run_foreground_passes(
         |step| match step {
             ForegroundStep::Set => {
                 let _ = SetForegroundWindow(hwnd);
@@ -2120,13 +2131,23 @@ unsafe fn attempt_foreground(hwnd: HWND) {
             }
         },
         || in_front(hwnd),
+        || {
+            let foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            let target_thread = GetWindowThreadProcessId(hwnd, None);
+            let mut threads = Vec::new();
+            if foreground_thread != 0 && foreground_thread != current {
+                threads.push(foreground_thread);
+            }
+            if target_thread != 0 && target_thread != current && target_thread != foreground_thread {
+                threads.push(target_thread);
+            }
+            threads
+        },
+        |thread| AttachThreadInput(current, thread, true).0 != 0,
+        |thread| {
+            let _ = AttachThreadInput(current, thread, false);
+        },
     );
-    if attached_foreground {
-        let _ = AttachThreadInput(current, foreground_thread, false);
-    }
-    if attached_target {
-        let _ = AttachThreadInput(current, target_thread, false);
-    }
 }
 
 /// One way `attempt_foreground` tries to bring the target forward.
@@ -2152,6 +2173,44 @@ fn run_foreground_steps(mut run: impl FnMut(ForegroundStep), in_front: impl Fn()
             return;
         }
         run(step);
+    }
+}
+
+/// `attempt_foreground`'s passes: `run_foreground_steps` with no attach, then, only while the target
+/// is still not in front, `attach` to each of `threads` (taken then, so they name the foreground
+/// as it is after the first pass) and the full steps again. Every attach that took is detached
+/// (`Detach`), on every path, a panic in a step or an attach included (deskpass #5).
+fn run_foreground_passes<T: Copy>(
+    mut run: impl FnMut(ForegroundStep),
+    in_front: impl Fn() -> bool,
+    threads: impl FnOnce() -> Vec<T>,
+    mut attach: impl FnMut(T) -> bool,
+    detach: impl FnMut(T),
+) {
+    run_foreground_steps(&mut run, &in_front);
+    if in_front() {
+        return;
+    }
+    let mut attached = Detach { attached: Vec::new(), detach };
+    for thread in threads() {
+        if attach(thread) {
+            attached.attached.push(thread);
+        }
+    }
+    run_foreground_steps(&mut run, &in_front);
+}
+
+/// The attaches `run_foreground_passes` made, each detached, in the order made, when this drops.
+struct Detach<T, F: FnMut(T)> {
+    attached: Vec<T>,
+    detach: F,
+}
+
+impl<T, F: FnMut(T)> Drop for Detach<T, F> {
+    fn drop(&mut self) {
+        for thread in self.attached.drain(..) {
+            (self.detach)(thread);
+        }
     }
 }
 
@@ -2700,14 +2759,25 @@ fn unicode_input(unit: u16, up: bool) -> INPUT {
     }
 }
 
+/// The arrows and the Home/End/PageUp/PageDown/Insert/Delete block are extended keys. Sent without
+/// `KEYEVENTF_EXTENDEDKEY`, Windows reads them as the numpad keys and, with NumLock on, releases
+/// shift, so shift plus an arrow selects nothing.
+fn is_extended(key: VIRTUAL_KEY) -> bool {
+    matches!(key, VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN | VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_INSERT | VK_DELETE)
+}
+
 fn key_input(key: VIRTUAL_KEY, up: bool) -> INPUT {
+    let mut flags = if up { KEYEVENTF_KEYUP } else { Default::default() };
+    if is_extended(key) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: key,
                 wScan: 0,
-                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
             },
@@ -3134,6 +3204,31 @@ pub fn wait_for_pending_ime_reopens() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS;
+
+    fn key_flags(key: VIRTUAL_KEY, up: bool) -> KEYBD_EVENT_FLAGS {
+        unsafe { key_input(key, up).Anonymous.ki.dwFlags }
+    }
+
+    /// The arrows and the Home/End/PageUp/PageDown/Insert/Delete block must carry
+    /// `KEYEVENTF_EXTENDEDKEY`, or Windows reads them as the numpad keys; other keys must not.
+    #[test]
+    fn navigation_keys_are_sent_as_extended_keys_and_other_keys_are_not() {
+        for key in [VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_INSERT, VK_DELETE] {
+            for up in [false, true] {
+                assert!(key_flags(key, up).contains(KEYEVENTF_EXTENDEDKEY), "{key:?} up={up} lacks KEYEVENTF_EXTENDEDKEY");
+            }
+        }
+        for key in [VIRTUAL_KEY(b'A' as u16), VK_RETURN, VK_SHIFT, VK_ESCAPE] {
+            for up in [false, true] {
+                assert!(!key_flags(key, up).contains(KEYEVENTF_EXTENDEDKEY), "{key:?} up={up} has KEYEVENTF_EXTENDEDKEY");
+            }
+        }
+        for key in [VK_LEFT, VK_DELETE, VIRTUAL_KEY(b'A' as u16), VK_SHIFT] {
+            assert!(!key_flags(key, false).contains(KEYEVENTF_KEYUP), "{key:?} press has KEYEVENTF_KEYUP");
+            assert!(key_flags(key, true).contains(KEYEVENTF_KEYUP), "{key:?} release lacks KEYEVENTF_KEYUP");
+        }
+    }
 
     /// Windows turns a `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` coordinate back into the
     /// pixel `floor(normalized * size / 65536)` from the virtual screen's origin (measured with
@@ -3317,6 +3412,72 @@ mod tests {
         assert_eq!(ran(Some(BringToTop)), [Set, AltThenSet, SwitchTo, BringToTop]);
         assert_eq!(ran(Some(Set)), [Set]);
         assert_eq!(ran(None), [Set, AltThenSet, SwitchTo, BringToTop, AltThenSet]);
+    }
+
+    /// deskpass #5: attaching to the foreground and target threads while the user types loses
+    /// keys, so the steps first run with no attach; only a target still behind after all of them
+    /// gets the attach, a second full pass, and a detach of every attach that took, even when a
+    /// step panics.
+    #[test]
+    fn foreground_passes_attach_only_after_a_full_pass_without_it() {
+        use ForegroundStep::*;
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Step(ForegroundStep),
+            Attach(u32),
+            Detach(u32),
+        }
+        use Event::{Attach, Detach, Step};
+        let steps = || FOREGROUND_STEPS.map(Step);
+        // `in_front_after(step, pass)`: the target comes in front after `step` in `pass` (1 or 2).
+        let passes = |in_front_after: Option<(ForegroundStep, usize)>, attaches: &[(u32, bool)], panic_in_second: bool| {
+            let events = std::cell::RefCell::new(Vec::new());
+            let pass = std::cell::Cell::new(1);
+            let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_foreground_passes(
+                    |step| {
+                        if panic_in_second && pass.get() == 2 {
+                            panic!("a step in the second pass panicked");
+                        }
+                        events.borrow_mut().push(Step(step));
+                    },
+                    || in_front_after.is_some_and(|(last, in_pass)| pass.get() == in_pass && events.borrow().last() == Some(&Step(last))),
+                    || {
+                        pass.set(2);
+                        attaches.iter().map(|(thread, _)| *thread).collect()
+                    },
+                    |thread| {
+                        events.borrow_mut().push(Attach(thread));
+                        attaches.iter().any(|(attached, took)| *attached == thread && *took)
+                    },
+                    |thread| events.borrow_mut().push(Detach(thread)),
+                );
+            }));
+            (ended.is_ok(), events.into_inner())
+        };
+        let both = [(7, true), (9, true)];
+
+        assert_eq!(passes(Some((Set, 1)), &both, false), (true, vec![Step(Set)]), "in front after the first Set: no attach");
+
+        let mut never: Vec<Event> = steps().into();
+        never.extend([Attach(7), Attach(9)]);
+        never.extend(steps());
+        never.extend([Detach(7), Detach(9)]);
+        assert_eq!(passes(None, &both, false), (true, never), "never in front: attach, a second full pass, detach");
+
+        let mut second_set: Vec<Event> = steps().into();
+        second_set.extend([Attach(7), Attach(9), Step(Set), Detach(7), Detach(9)]);
+        assert_eq!(passes(Some((Set, 2)), &both, false), (true, second_set), "in front after the attached Set");
+
+        let mut failed: Vec<Event> = steps().into();
+        failed.extend([Attach(7), Attach(9)]);
+        failed.extend(steps());
+        failed.push(Detach(9));
+        assert_eq!(passes(None, &[(7, false), (9, true)], false), (true, failed), "an attach that failed is not detached");
+
+        let mut panicked: Vec<Event> = steps().into();
+        panicked.extend([Attach(7), Attach(9), Detach(7), Detach(9)]);
+        assert_eq!(passes(None, &both, true), (false, panicked), "a step that panics still detaches");
     }
 
     /// Ticket 82: a lone ALT released puts the target in menu or keytip mode, which eats the keys

@@ -68,7 +68,7 @@ test("without an expected build id only the protocol version is checked", async 
     await unknown.close();
     await missing.close();
   }
-  const wrongProtocol = await launchScriptedHelper({ version: "10" }, { expectedBuild: null, log: () => {} });
+  const wrongProtocol = await launchScriptedHelper({ version: "18" }, { expectedBuild: null, log: () => {} });
   try {
     const failure = await failureOf(wrongProtocol.helper.request("list_windows", {}));
     assert.equal(failure.code, "helper_version_mismatch");

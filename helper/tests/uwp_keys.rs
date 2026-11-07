@@ -102,6 +102,11 @@ mod uia {
     pub fn click_point(_: &serde_json::Value, _: i32, _: i32) -> Result<serde_json::Value, crate::protocol::Failure> {
         unreachable!("these tests click no points in the background")
     }
+
+    /// The background scroll (reference-gaps G5); these tests scroll nothing in the background.
+    pub fn scroll_point(_: &serde_json::Value, _: i32, _: i32, _: &str, _: u64) -> Result<serde_json::Value, crate::protocol::Failure> {
+        unreachable!("these tests scroll nothing in the background")
+    }
 }
 
 /// The foreground restore report `input.rs` turns into a result (ticket 138); these tests take no
@@ -118,6 +123,9 @@ mod restore {
     pub unsafe fn foreground_inside(_user: windows::Win32::Foundation::HWND) -> bool {
         unreachable!("these tests take no background action")
     }
+
+    /// `foreground` ends a background action's late watch; these tests take none, so there is none.
+    pub unsafe fn end_late_watches(_target: windows::Win32::Foundation::HWND) {}
 }
 
 #[allow(dead_code)]

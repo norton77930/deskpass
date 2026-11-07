@@ -100,8 +100,13 @@ fn main() {
 /// `ask_user`'s `allow_always` and its answer `allow_always`, and `grant_mac` without `key_path`
 /// (the key in the helper's own folder, or `--grants-dir`) (95); 8 `read_clipboard` and
 /// `ask_user`'s kind `read_clipboard` (97); 9 `list_start_menu_apps` (116) and `confirm_change`
-/// (114), which the settings server uses (115).
-const PROTOCOL_VERSION: &str = "9";
+/// (114), which the settings server uses (115); 10 `app_identity`'s `original_name`, without which a
+/// signed file is known by its path; 11 `ask_user`'s kind `system_key` (reference-gaps G1); 12
+/// `find_in_ui_tree` (reference-gaps G2); 13 `get_ui_tree`'s `max_depth` and `interactive_only`
+/// (reference-gaps G3); 14 `get_ui_tree`'s `root_element_index` and `tree_id` (reference-gaps G3); 15
+/// `read_text` (reference-gaps G4); 16 `read_text`'s `offset` (reference-gaps G4); 17 `scroll`'s
+/// `delivery_mode` (reference-gaps G5).
+const PROTOCOL_VERSION: &str = "17";
 
 /// Methods that send input. While stopped they are answered `interrupted` without running.
 /// `click` covers a click on an element too (ticket 62); `set_value` and `element_action` are the
@@ -110,13 +115,14 @@ const PROTOCOL_VERSION: &str = "9";
 const INPUT_METHODS: [&str; 10] = ["activate_window", "click", "type_text", "press_key", "scroll", "drag", "move_mouse", "set_value", "element_action", "paste_text"];
 
 /// Ticket 145: an input request delivered in the foreground, during which a physical single Esc
-/// stops: every input method but a `click`, `set_value` or `element_action` whose `delivery_mode`
-/// is background (one without it is foreground, `input::Delivery`).
+/// stops: every input method but a `click`, `scroll` (reference-gaps G5), `set_value` or
+/// `element_action` whose `delivery_mode` is background (one without it is foreground,
+/// `input::Delivery`).
 fn is_foreground_input(method: &str, params: &serde_json::Value) -> bool {
     if !INPUT_METHODS.contains(&method) {
         return false;
     }
-    let has_delivery = matches!(method, "click" | "set_value" | "element_action");
+    let has_delivery = matches!(method, "click" | "scroll" | "set_value" | "element_action");
     !has_delivery || !matches!(input::Delivery::from_params(params), Ok(input::Delivery::Background))
 }
 
@@ -292,6 +298,15 @@ fn dispatch(request: Request) -> protocol::Response {
             Ok(result) => ok(request.id, result),
             Err(failure) => failure.into_response(request.id),
         },
+        "find_in_ui_tree" => match uia::find_in_ui_tree(&request.params) {
+            Ok(result) => ok(request.id, result),
+            Err(failure) => failure.into_response(request.id),
+        },
+        // Reference-gaps G4: the text of an element, read on the UI Automation worker.
+        "read_text" => match uia::read_text(&request.params) {
+            Ok(result) => ok(request.id, result),
+            Err(failure) => failure.into_response(request.id),
+        },
         "capture_window" => match capture::capture_window(&request.params) {
             Ok(result) => ok(request.id, result),
             Err((code, message)) => err(request.id, &code, message),
@@ -378,7 +393,11 @@ mod tests {
         assert!(is_foreground_input("set_value", &json!({ "delivery_mode": "foreground" })));
         assert!(!is_foreground_input("element_action", &json!({ "delivery_mode": "background" })));
         assert!(!is_foreground_input("click", &json!({ "delivery_mode": "background" })));
+        assert!(!is_foreground_input("scroll", &json!({ "delivery_mode": "background" })));
+        assert!(is_foreground_input("scroll", &json!({ "x": 1, "y": 1 })), "a scroll without delivery_mode is the wheel");
+        assert!(is_foreground_input("scroll", &json!({ "delivery_mode": "foreground" })));
         assert!(!is_foreground_input("get_ui_tree", &json!({})), "a read is no input");
+        assert!(!is_foreground_input("find_in_ui_tree", &json!({ "query": "x" })), "a poll is no input");
         assert!(!is_foreground_input("overlay_show", &json!({ "delivery_mode": "foreground" })));
     }
 }

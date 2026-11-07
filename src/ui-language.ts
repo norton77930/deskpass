@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { systemTool } from "./system-tools.ts";
 
 /**
  * Open-source ticket 01: the user interface language of Deskpass, decided once when a server (the
@@ -45,7 +46,7 @@ export function parseRegMultiSz(output: string, name: string): string[] {
 
 function queryRegistry(key: string, name: string): Promise<string[]> {
   return new Promise((resolve) => {
-    execFile("reg.exe", ["query", key, "/v", name], { windowsHide: true, timeout: 5_000, encoding: "utf8" }, (error, stdout) => {
+    execFile(systemTool("reg.exe"), ["query", key, "/v", name], { windowsHide: true, timeout: 5_000, encoding: "utf8" }, (error, stdout) => {
       resolve(error ? [] : parseRegMultiSz(stdout, name));
     });
   });

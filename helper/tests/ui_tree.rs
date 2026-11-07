@@ -645,6 +645,386 @@ fn only_the_largest_document_having_content_makes_the_web_content_ready() {
     assert!(ready < Duration::from_millis(450), "ready at once: {ready:?}");
 }
 
+/// Reference-gaps G2: `find_in_ui_tree` answers whether a query matches by `get_ui_tree`'s rule
+/// (name or value, without regard to case, past the limits a plain tree cuts at, never a password
+/// box's text), keeps no tree and issues no id, and so leaves the trees a caller holds alone: more
+/// polls than the five trees a window keeps, and an element of a tree read before them still acts.
+#[test]
+fn find_in_ui_tree_polls_by_the_query_rule_and_keeps_nothing() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let mut fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).args(["--ui-controls", "--ui-content", "--ui-read-only"]).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let app = helper.request("get_window", json!({ "window_id": window_id }))["result"]["app"].as_str().expect("app").to_string();
+
+    let held = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(held["ok"], true, "{held}");
+    let held_id = held["result"]["tree_id"].clone();
+    let check = find(held["result"]["elements"].as_array().expect("elements"), |element| element["name"] == "Remember me")["index"].clone();
+    assert!(check.as_u64().is_some(), "{held}");
+
+    // Nine polls: more than the five trees a window keeps. Each answers only whether it found, with no tree.
+    for _ in 0..9 {
+        let polled = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "expected_app": app, "query": "REMEMBER" }));
+        assert_eq!(polled["ok"], true, "{polled}");
+        assert_eq!(polled["result"]["found"], true, "{polled}");
+        for field in ["tree_id", "elements", "window_title", "truncated"] {
+            assert!(polled["result"].get(field).is_none(), "a poll must not carry {field}: {polled}");
+        }
+    }
+    // The tree read before them is still kept, so its element still takes an action (a dropped tree is refused).
+    let toggled = helper.request("element_action", json!({ "window_id": window_id, "tree_id": held_id, "index": check, "action": "toggle" }));
+    assert_eq!(toggled["ok"], true, "the polls dropped the tree the caller holds: {toggled}");
+
+    // Not there; by value and without regard to case; past the 60 children a plain tree shows; never a password box's text.
+    let miss = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "query": "no such text anywhere" }));
+    assert_eq!(miss["result"]["found"], false, "{miss}");
+    for (query, label) in [("FIXED TEXT", "by value"), ("b65", "past the limits")] {
+        let hit = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "query": query }));
+        assert_eq!(hit["result"]["found"], true, "{label}: {hit}");
+    }
+    let secret = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "query": "secret-42" }));
+    assert_eq!(secret["result"]["found"], false, "{secret}");
+    assert!(!secret.to_string().contains(SECRET), "{secret}");
+
+    // A query is required, and is text.
+    for params in [json!({ "window_id": window_id }), json!({ "window_id": window_id, "query": "" }), json!({ "window_id": window_id, "query": 5 })] {
+        let refused = helper.request("find_in_ui_tree", params.clone());
+        assert_eq!(refused["error"]["code"], "invalid_params", "{params}: {refused}");
+    }
+    // The app is compared as get_ui_tree compares it.
+    let other = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "expected_app": "C:\\Apps\\other.exe", "query": "x" }));
+    assert_eq!(other["error"]["code"], "app_changed", "{other}");
+
+    // A stopped helper answers interrupted, and one that is let go on answers again.
+    assert_eq!(helper.request("debug_stop", json!({}))["ok"], true);
+    let stopped = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "query": "x" }));
+    assert_eq!(stopped["error"]["code"], "interrupted", "{stopped}");
+    assert_eq!(helper.request("resume", json!({}))["ok"], true);
+
+    // A window that is closed is window_not_found, not an empty answer.
+    let _ = fixture.0.kill();
+    let _ = fixture.0.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let closed = loop {
+        let closed = helper.request("find_in_ui_tree", json!({ "window_id": window_id, "expected_app": app, "query": "x" }));
+        if closed["ok"] == false || Instant::now() > deadline {
+            break closed;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(closed["error"]["code"], "window_not_found", "{closed}");
+}
+
+/// Reference-gaps G3: `max_depth` shows that many levels from the top and counts what is below on
+/// the last one (`truncated: depth`), at any depth up to the 30 the walk always had; the new
+/// parameters are checked; every read is a tree of its own.
+#[test]
+fn max_depth_cuts_the_levels_below_it_and_counts_the_children_left_out() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).args(["--ui-controls", "--ui-content", "--ui-read-only"]).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let plain = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(plain["ok"], true, "{plain}");
+    let plain_elements = plain["result"]["elements"].as_array().expect("elements");
+    let fruits = find(plain_elements, |element| element["role"] == "tree item" && element["name"] == "Fruits");
+    let apple = find(plain_elements, |element| element["role"] == "tree item" && element["name"] == "Apple");
+    let (fruits_depth, apple_depth) = (fruits["depth"].as_u64().expect("depth"), apple["depth"].as_u64().expect("depth"));
+    assert!(apple_depth > fruits_depth, "{fruits} {apple}");
+    let container = find(plain_elements, |element| element["name"] == "Many buttons");
+    let container_depth = container["depth"].as_u64().expect("depth");
+
+    // Down to the tree item and no further: Apple is counted on Fruits, and the cut is named.
+    let cut = helper.request("get_ui_tree", json!({ "window_id": window_id, "max_depth": fruits_depth + 1 }));
+    assert_eq!(cut["ok"], true, "{cut}");
+    let tree = &cut["result"];
+    assert_eq!(tree["truncated"], json!(["depth"]), "{tree}");
+    let elements = tree["elements"].as_array().expect("elements");
+    assert!(elements.iter().all(|element| element["depth"].as_u64().is_some_and(|depth| depth <= fruits_depth)), "{tree}");
+    assert!(!elements.iter().any(|element| element["name"] == "Apple"), "{tree}");
+    let cut_fruits = find(elements, |element| element["name"] == "Fruits");
+    assert!(cut_fruits["omitted_children"].as_u64().is_some_and(|count| count >= 1), "the children below the limit are counted: {cut_fruits}");
+    assert_ne!(tree["tree_id"], plain["result"]["tree_id"], "{tree}");
+    // Numbered from 1 in walk order, as always.
+    assert!(elements.iter().filter_map(|element| element["index"].as_u64()).zip(1..).all(|(index, expected)| index == expected), "{tree}");
+
+    // The 70 buttons are the container's children, none shown at the level above them, all counted.
+    let top = helper.request("get_ui_tree", json!({ "window_id": window_id, "max_depth": container_depth + 1 }));
+    let elements = top["result"]["elements"].as_array().expect("elements");
+    let shut = find(elements, |element| element["name"] == "Many buttons");
+    assert_eq!(shut["omitted_children"], 70, "{shut}");
+    assert!(!elements.iter().any(|element| element["name"] == "B1"), "{}", top["result"]);
+
+    // The most there is (30) reads what no max_depth reads.
+    let deepest = helper.request("get_ui_tree", json!({ "window_id": window_id, "max_depth": 30 }));
+    assert_eq!(deepest["ok"], true, "{deepest}");
+    assert!(deepest["result"].get("truncated").is_none(), "{}", deepest["result"]);
+    let outline = |tree: &Value| tree["elements"].as_array().expect("elements").iter().map(|element| (element["depth"].clone(), element["role"].clone(), element["name"].clone())).collect::<Vec<_>>();
+    assert_eq!(outline(&deepest["result"]), outline(&plain["result"]));
+
+    // Outside 1 to 30, or not a whole number, is refused before anything is read.
+    for bad in [json!(0), json!(31), json!(-1), json!(1.5), json!("3"), json!(null)] {
+        let refused = helper.request("get_ui_tree", json!({ "window_id": window_id, "max_depth": bad.clone() }));
+        assert_eq!(refused["error"]["code"], "invalid_params", "{bad}: {refused}");
+    }
+    let refused = helper.request("get_ui_tree", json!({ "window_id": window_id, "interactive_only": "yes" }));
+    assert_eq!(refused["error"]["code"], "invalid_params", "{refused}");
+}
+
+/// Reference-gaps G3: `interactive_only` keeps the numbered elements, numbered as the whole tree
+/// numbers them, and the lines above them; it works with `query` and `max_depth`, and a number of
+/// the tree it returns clicks.
+#[test]
+fn interactive_only_keeps_numbered_elements_and_their_ancestors_and_its_numbers_click() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).args(["--ui-controls", "--ui-content", "--ui-read-only"]).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let plain = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(plain["ok"], true, "{plain}");
+    assert!(plain["result"].get("truncated").is_none(), "the plain tree is whole, so the two can be compared: {}", plain["result"]);
+    let plain_elements = plain["result"]["elements"].as_array().expect("elements");
+    let container_depth = find(plain_elements, |element| element["name"] == "Many buttons")["depth"].as_u64().expect("depth");
+
+    let read = helper.request("get_ui_tree", json!({ "window_id": window_id, "interactive_only": true }));
+    assert_eq!(read["ok"], true, "{read}");
+    let tree = &read["result"];
+    assert_ne!(tree["tree_id"], plain["result"]["tree_id"], "{tree}");
+    let elements = tree["elements"].as_array().expect("elements");
+    assert!(elements.len() < plain_elements.len(), "labels were left out: {} lines of {}", elements.len(), plain_elements.len());
+    // Every line is numbered or has a numbered line below it.
+    for (at, element) in elements.iter().enumerate() {
+        if element.get("index").is_some() {
+            continue;
+        }
+        let depth = element["depth"].as_u64().expect("depth");
+        let has_numbered_below = elements[at + 1..].iter().take_while(|next| next["depth"].as_u64() > Some(depth)).any(|next| next.get("index").is_some());
+        assert!(has_numbered_below, "a line with nothing numbered below it: {element}");
+    }
+    // The same elements are numbered, with the same numbers, as in the whole tree.
+    let numbered = |list: &[Value]| list.iter().filter(|element| element.get("index").is_some()).map(|element| (element["index"].clone(), element["role"].clone(), element["name"].clone())).collect::<Vec<_>>();
+    assert_eq!(numbered(elements), numbered(plain_elements), "{tree}");
+    // The 60-child limit is the same: ten buttons are counted on the container.
+    assert_eq!(find(elements, |element| element["name"] == "Many buttons")["omitted_children"], 10, "{tree}");
+
+    // With a query: only a numbered element that matches, and its ancestors. A label that matches is not one.
+    let found = helper.request("get_ui_tree", json!({ "window_id": window_id, "interactive_only": true, "query": "b65", "max_depth": container_depth + 2 }));
+    assert_eq!(found["ok"], true, "{found}");
+    let found_tree = &found["result"];
+    assert!(found_tree.get("truncated").is_none(), "{found_tree}");
+    let names: Vec<&str> = found_tree["elements"].as_array().expect("elements").iter().filter_map(|element| element["name"].as_str()).collect();
+    assert_eq!(names, ["Many buttons", "B65"], "{found_tree}");
+    let label_only = helper.request("get_ui_tree", json!({ "window_id": window_id, "interactive_only": true, "query": "Many buttons" }));
+    assert_eq!(label_only["result"]["elements"], json!([]), "{label_only}");
+
+    // The returned tree is the window's own tree: its number acts.
+    let activated = helper.request("activate_window", json!({ "window_id": window_id }));
+    assert_eq!(activated["ok"], true, "foreground failed, so the click must fail rather than skip: {activated}");
+    let clicked = helper.request("click", json!({ "window_id": window_id, "element": { "tree_id": found_tree["tree_id"], "index": 1 } }));
+    assert_eq!(clicked["ok"], true, "{clicked}");
+    std::thread::sleep(Duration::from_millis(150));
+    let title = helper.request("get_window", json!({ "window_id": window_id }))["result"]["title"].as_str().unwrap_or("").to_string();
+    assert!(title.contains("many:B65"), "the click by number did not reach B65: {title}");
+}
+
+/// Reference-gaps G3 (ticket 06): a subtree is the root at depth 0 and what is below it, nothing
+/// of the rest of the window; `max_depth` counts from the root; the tree has its own id and
+/// describes its root; its numbers click; it works with `interactive_only` and a `query`.
+#[test]
+fn a_subtree_starts_at_its_root_and_its_numbers_click() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).args(["--ui-controls", "--ui-content", "--ui-read-only"]).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let plain = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(plain["ok"], true, "{plain}");
+    let plain_id = plain["result"]["tree_id"].clone();
+    let plain_elements = plain["result"]["elements"].as_array().expect("elements");
+    let fruits = find(plain_elements, |element| element["role"] == "tree item" && element["name"] == "Fruits");
+    let fruits_index = fruits["index"].clone();
+    assert!(fruits_index.as_u64().is_some(), "{fruits}");
+
+    let read = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": fruits_index, "tree_id": plain_id }));
+    assert_eq!(read["ok"], true, "{read}");
+    let tree = &read["result"];
+    assert_ne!(tree["tree_id"], plain_id, "{tree}");
+    assert_eq!(tree["root"], json!({ "role": "tree item", "name": "Fruits" }), "{tree}");
+    let elements = tree["elements"].as_array().expect("elements");
+    // The root is the first line, at depth 0 and numbered 1; everything else is below it.
+    assert_eq!(elements[0]["name"], "Fruits", "{tree}");
+    assert_eq!((elements[0]["depth"].as_u64(), elements[0]["index"].as_u64()), (Some(0), Some(1)), "{tree}");
+    assert!(elements[1..].iter().all(|element| element["depth"].as_u64().is_some_and(|depth| depth >= 1)), "{tree}");
+    let names: Vec<&str> = elements.iter().filter_map(|element| element["name"].as_str()).collect();
+    assert_eq!(names, ["Fruits", "Apple", "Banana"], "{tree}");
+    assert!(tree.get("truncated").is_none(), "{tree}");
+
+    // A subtree is a tree like any: a root can be chosen in it, and number 1 of it is Fruits itself.
+    let latest = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": 1, "tree_id": tree["tree_id"] }));
+    assert_eq!(latest["ok"], true, "{latest}");
+    assert_eq!(latest["result"]["root"]["name"], "Fruits", "{latest}");
+
+    // max_depth counts from the root: 1 is the root alone, with its children counted; 2 reaches them.
+    let one = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": fruits_index, "tree_id": plain_id, "max_depth": 1 }));
+    assert_eq!(one["ok"], true, "{one}");
+    let one_elements = one["result"]["elements"].as_array().expect("elements");
+    assert_eq!(one_elements.len(), 1, "{}", one["result"]);
+    assert!(one_elements[0]["omitted_children"].as_u64().is_some_and(|count| count >= 2), "{}", one["result"]);
+    assert_eq!(one["result"]["truncated"], json!(["depth"]), "{}", one["result"]);
+    let two = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": fruits_index, "tree_id": plain_id, "max_depth": 2 }));
+    assert_eq!(two["result"]["elements"].as_array().map(Vec::len), Some(3), "{}", two["result"]);
+    assert!(two["result"].get("truncated").is_none(), "{}", two["result"]);
+
+    // With interactive_only and a query: the root is the ancestor of what is kept.
+    let found = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": fruits_index, "tree_id": plain_id, "interactive_only": true, "query": "banana" }));
+    assert_eq!(found["ok"], true, "{found}");
+    let found_names: Vec<&str> = found["result"]["elements"].as_array().expect("elements").iter().filter_map(|element| element["name"].as_str()).collect();
+    assert_eq!(found_names, ["Fruits", "Banana"], "{}", found["result"]);
+
+    // The subtree is the window's own tree: its number acts. Banana is the third line, numbered 3.
+    let activated = helper.request("activate_window", json!({ "window_id": window_id }));
+    assert_eq!(activated["ok"], true, "foreground failed, so the click must fail rather than skip: {activated}");
+    // A fresh tree to root it in: the reads above have pushed `plain_id` out of the five a window keeps.
+    let fresh = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(fresh["ok"], true, "{fresh}");
+    let fresh_fruits = find(fresh["result"]["elements"].as_array().expect("elements"), |element| element["role"] == "tree item" && element["name"] == "Fruits")["index"].clone();
+    let subtree = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": fresh_fruits, "tree_id": fresh["result"]["tree_id"] }));
+    assert_eq!(subtree["ok"], true, "{subtree}");
+    let banana = find(subtree["result"]["elements"].as_array().expect("elements"), |element| element["name"] == "Banana")["index"].clone();
+    let clicked = helper.request("click", json!({ "window_id": window_id, "element": { "tree_id": subtree["result"]["tree_id"], "index": banana } }));
+    assert_eq!(clicked["ok"], true, "{clicked}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let after = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+        let selected = after["result"]["elements"].as_array().expect("elements").iter().any(|element| element["name"] == "Banana" && has(element, "states", "selected"));
+        if selected {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the click by number did not reach Banana: {after}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Reference-gaps G3 (ticket 06): the target's popups are not part of a subtree. With the fixture's
+/// menu open, a root in the window reads without a menu item; a root in the menu reads that item
+/// and not its siblings.
+#[test]
+fn a_subtree_leaves_out_the_popups_of_the_window() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).args(["--ui-controls", "--popup-menu"]).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let activated = helper.request("activate_window", json!({ "window_id": window_id }));
+    assert_eq!(activated["ok"], true, "{activated}");
+    let info = helper.request("get_window", json!({ "window_id": window_id }));
+    let (width, height) = (info["result"]["width"].as_i64().expect("width"), info["result"]["height"].as_i64().expect("height"));
+    let opened = helper.request("click", json!({ "window_id": window_id, "x": width * 300 / 480, "y": height * 340 / 360, "button": "right" }));
+    assert_eq!(opened["ok"], true, "{opened}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let title = helper.request("get_window", json!({ "window_id": window_id }))["result"]["title"].as_str().unwrap_or("").to_string();
+        if title.contains("menulast:") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the menu did not open: {title}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let plain = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(plain["ok"], true, "{plain}");
+    let plain_id = plain["result"]["tree_id"].clone();
+    let plain_elements = plain["result"]["elements"].as_array().expect("elements");
+    assert_eq!(plain_elements.iter().filter(|element| element["role"] == "menu item").count(), 8, "the whole tree has the menu: {}", plain["result"]);
+    let button = find(plain_elements, |element| element["role"] == "button")["index"].clone();
+    let third = find(plain_elements, |element| element["name"] == "Menu item 3")["index"].clone();
+
+    let from_window = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": button, "tree_id": plain_id }));
+    let from_menu = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": third, "tree_id": plain_id }));
+    let _ = helper.request("press_key", json!({ "window_id": window_id, "keys": ["escape"] }));
+    assert_eq!(from_window["ok"], true, "{from_window}");
+    assert!(!from_window.to_string().contains("Menu item"), "the menu is in a subtree of the window: {from_window}");
+    assert_eq!(from_menu["ok"], true, "{from_menu}");
+    let names: Vec<&str> = from_menu["result"]["elements"].as_array().expect("elements").iter().filter_map(|element| element["name"].as_str()).collect();
+    assert_eq!(names, ["Menu item 3"], "{}", from_menu["result"]);
+}
+
+/// Reference-gaps G3 (ticket 06): a root that is gone is `element_not_found`, as for any element
+/// tool, and issues no tree; a tree the helper does not have is `no_ui_tree`; an index past the
+/// tree, another window's tree and parameters of the wrong kind are `invalid_params`.
+#[test]
+fn a_stale_root_is_element_not_found_and_a_bad_root_is_refused() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).arg("--ui-section").spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let activated = helper.request("activate_window", json!({ "window_id": window_id }));
+    assert_eq!(activated["ok"], true, "{activated}");
+    let first = helper.request("get_ui_tree", json!({ "window_id": window_id }));
+    assert_eq!(first["ok"], true, "{first}");
+    let tree_id = first["result"]["tree_id"].clone();
+    let elements = first["result"]["elements"].as_array().expect("elements");
+    let close = find(elements, |element| element["role"] == "button" && element["name"] == "Close section")["index"].clone();
+    let count = elements.iter().filter(|element| element.get("index").is_some()).count();
+
+    // Alive, the button is a root of its own.
+    let alive = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": close, "tree_id": tree_id }));
+    assert_eq!(alive["ok"], true, "{alive}");
+    assert_eq!(alive["result"]["root"], json!({ "role": "button", "name": "Close section" }), "{alive}");
+
+    let clicked = helper.request("click", json!({ "window_id": window_id, "element": { "tree_id": tree_id, "index": close } }));
+    assert_eq!(clicked["ok"], true, "{clicked}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !helper.request("get_ui_tree", json!({ "window_id": window_id }))["result"]["elements"].as_array().expect("elements").iter().all(|element| element["name"] != "Close section") {
+        assert!(Instant::now() < deadline, "the section did not close");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stale = helper.request("get_ui_tree", json!({ "window_id": window_id, "root_element_index": close, "tree_id": tree_id }));
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["code"], "element_not_found", "{stale}");
+    assert!(stale["error"]["message"].as_str().unwrap_or("").contains("new tree"), "{stale}");
+
+    let refusals = [
+        (json!({ "root_element_index": 1, "tree_id": "t999-zzzzz" }), "no_ui_tree"),
+        (json!({ "root_element_index": count + 1, "tree_id": tree_id }), "invalid_params"),
+        (json!({ "root_element_index": 0, "tree_id": tree_id }), "invalid_params"),
+        (json!({ "root_element_index": 1.5, "tree_id": tree_id }), "invalid_params"),
+        (json!({ "root_element_index": "1", "tree_id": tree_id }), "invalid_params"),
+        (json!({ "root_element_index": 1 }), "invalid_params"),
+        (json!({ "root_element_index": 1, "tree_id": "" }), "invalid_params"),
+        (json!({ "tree_id": tree_id }), "invalid_params"),
+    ];
+    for (extra, code) in refusals {
+        let mut params = json!({ "window_id": window_id });
+        params.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+        let refused = helper.request("get_ui_tree", params);
+        assert_eq!(refused["error"]["code"], code, "{extra}: {refused}");
+    }
+}
+
 fn read_timed(helper: &mut Helper, window_id: &str) -> (Value, Duration) {
     let started = Instant::now();
     let read = helper.request("get_ui_tree", json!({ "window_id": window_id }));

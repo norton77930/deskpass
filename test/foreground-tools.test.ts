@@ -7,6 +7,8 @@ import { connectServer, textContent, type FakeHandler, type Harness } from "./ha
 // Ticket 142: delivery_mode on the tools that only have a foreground path (seam A: the server with a
 // scripted helper). Default and "foreground" are today's behavior; "background" is
 // background_unavailable (tool_needs_foreground) before the lock, approval, overlay or any input.
+// Reference-gaps G5 took computer_scroll out of this list: it has a background path and defaults to it
+// (test/scroll-background.test.ts).
 
 const demo = {
   window_id: "5",
@@ -48,7 +50,6 @@ const CASES: Case[] = [
   { action: "type_text", method: "type_text", args: { text: "hi" }, answer: { result: {} }, text: "Typed text into the target window." },
   { action: "press_key", method: "press_key", args: { key: "ctrl+s" }, answer: { result: {} }, text: "Pressed ctrl+s." },
   { action: "paste_text", method: "paste_text", args: { text: "hi" }, answer: { result: { read_confirmed: true, clipboard_restored: "full" } }, text: "Pasted the text into the target window; the focused element's value now contains it (read_confirmed: true)." },
-  { action: "scroll", method: "scroll", args: { x: 20, y: 30, direction: "down" }, answer: { result: {} }, text: "Scrolled down by 3." },
   { action: "drag", method: "drag", args: { from_x: 10, from_y: 10, to_x: 40, to_y: 50 }, answer: { result: {} }, text: "Dragged from" },
 ];
 
@@ -92,7 +93,7 @@ async function toolCalls(harness: Harness, tool: string): Promise<Record<string,
 
 type Tool = { name: string; inputSchema: { properties?: Record<string, { type?: string; enum?: string[] }>; required?: string[] } };
 
-test("ticket 142: the five foreground-only tools offer an optional delivery_mode of background or foreground", async () => {
+test("ticket 142: the four foreground-only tools offer an optional delivery_mode of background or foreground", async () => {
   const harness = await connectServer();
   try {
     const { tools } = (await harness.client.listTools()) as { tools: Tool[] };
@@ -248,14 +249,14 @@ test("ticket 142: a refused first step of a batch sends nothing, and its log eve
   try {
     await shoot(harness);
     const { result, lines } = await runBatch(harness, [
-      { action: "scroll", window_id: "5", x: 20, y: 30, direction: "down", delivery_mode: "background" },
+      { action: "drag", window_id: "5", from_x: 10, from_y: 10, to_x: 40, to_y: 50, delivery_mode: "background" },
       { action: "wait", seconds: 0.1 },
     ]);
     assert.equal(result.isError, true);
     assert.equal(lines[1], "stopped at step 1 of 2: background_unavailable");
     assert.deepEqual(await methodsAfterShot(harness), []);
     await harness.finish();
-    const calls = await toolCalls(harness, "computer_scroll");
+    const calls = await toolCalls(harness, "computer_drag");
     assert.deepEqual([calls[0]?.step, calls[0]?.result, calls[0]?.delivery, calls[0]?.reason], [1, "background_unavailable", "background", "tool_needs_foreground"]);
   } finally {
     await harness.close();

@@ -7,10 +7,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop, DESKTOP_READOBJECTS};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, GetKeyboardLayoutList, UnloadKeyboardLayout, HKL,
+    GetKeyboardLayout, GetKeyboardLayoutList, LoadKeyboardLayoutW, UnloadKeyboardLayout, HKL, KLF_NOTELLSHELL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, PostMessageW, SendMessageW, WM_IME_CONTROL, WM_INPUTLANGCHANGEREQUEST,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW, GetWindowThreadProcessId, PostMessageW, SendMessageW, GUITHREADINFO, WM_IME_CONTROL, WM_INPUTLANGCHANGEREQUEST,
 };
 
 #[path = "interactive_lock.rs"]
@@ -53,6 +53,90 @@ fn press_key_and_type_text_land_under_the_current_ime_and_restore_it() {
     assert_eq!(ime_is_open(hwnd), ime_open, "IME open status changed");
     drop(helper);
     drop(fixture);
+}
+
+/// Issue 7: with English and another layout already loaded (so the helper loads nothing and unloads
+/// nothing), typing still leaves every layout as it found it, time after time.
+#[test]
+fn typing_with_extra_layouts_already_loaded_restores_every_layout() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _extra = ExtraLayouts::load(&["00000409", "00000411"]);
+    let restore = LayoutGuard::capture();
+    let fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let hwnd = parse_hwnd(&window_id);
+    let activated = helper.request("activate_window", json!({ "window_id": window_id }));
+    assert_eq!(activated["ok"], true, "{activated}");
+    require_foreground(hwnd);
+    let target_layout = layout_of(hwnd);
+    let ime_open = ime_is_open(hwnd);
+    eprintln!("extra-layouts layout={target_layout:#x} foreground={:#x} ime_open={ime_open} list={:?}", restore.foreground_layout, restore.list.iter().map(|item| format!("{item:#x}")).collect::<Vec<_>>());
+    click_edit(&mut helper, &window_id);
+    for round in 0..10 {
+        replace(&mut helper, &window_id, hwnd, "你好é");
+        assert_eq!(layout_list(), restore.list, "keyboard layout list changed in round {round}");
+        assert_eq!(layout_of(hwnd), target_layout, "fixture thread layout changed in round {round}: {}", helper.stderr());
+        assert_eq!(ime_is_open(hwnd), ime_open, "IME open status changed in round {round}");
+        assert_eq!(layout_value(restore.foreground_thread), restore.foreground_layout, "foreground thread layout changed in round {round}: {}", helper.stderr());
+    }
+    drop(helper);
+    drop(fixture);
+}
+
+/// Issue 7: a target already on one of the extra layouts, English (which the helper switches to, so
+/// it has nothing to do) or another one, goes back to that layout, not to the first in the list.
+#[test]
+fn typing_into_a_target_on_an_extra_layout_returns_it_to_that_layout() {
+    if !interactive_desktop() {
+        eprintln!("SKIP interactive: no desktop");
+        return;
+    }
+    let _interactive = interactive_lock::acquire();
+    let _extra = ExtraLayouts::load(&["00000409", "00000411"]);
+    let restore = LayoutGuard::capture();
+    let fixture = KillOnDrop(Command::new(env!("CARGO_BIN_EXE_fixture-window")).spawn().expect("fixture"));
+    let mut helper = Helper::spawn();
+    let window_id = wait_for_fixture(&mut helper);
+    let hwnd = parse_hwnd(&window_id);
+    let activated = helper.request("activate_window", json!({ "window_id": window_id }));
+    assert_eq!(activated["ok"], true, "{activated}");
+    require_foreground(hwnd);
+    let start_layout = layout_of(hwnd);
+    click_edit(&mut helper, &window_id);
+    for layout in [0x04110411u64, 0x04090409, start_layout] {
+        unsafe {
+            let _ = PostMessageW(Some(focus_of(hwnd)), WM_INPUTLANGCHANGEREQUEST, WPARAM(0), LPARAM(layout as isize));
+        }
+        // Windows may move the thread on from what was asked for, with no input sent: the layout it
+        // settles on is the one the input has to leave as it found it.
+        std::thread::sleep(Duration::from_millis(800));
+        let settled = layout_of(hwnd);
+        eprintln!("asked for {layout:#x}, settled on {settled:#x}");
+        for round in 0..5 {
+            replace(&mut helper, &window_id, hwnd, "你好é");
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(layout_of(hwnd), settled, "the fixture left {settled:#x} in round {round}: {}", helper.stderr());
+            assert_eq!(layout_list(), restore.list, "keyboard layout list changed from {settled:#x} in round {round}");
+        }
+    }
+    drop(helper);
+    drop(fixture);
+}
+
+fn focus_of(hwnd: HWND) -> HWND {
+    unsafe {
+        let mut gui = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        if GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, None), &mut gui).is_ok() && !gui.hwndFocus.0.is_null() {
+            gui.hwndFocus
+        } else {
+            hwnd
+        }
+    }
 }
 
 #[test]
@@ -170,10 +254,18 @@ fn typing_that_closes_the_threads_last_window_reports_the_layout_it_could_not_re
     assert_eq!(layout_list(), restore.list, "keyboard layout list changed");
     // The window that takes the foreground once the fixture's closes (here the one in front before
     // the test) is put on the English layout the closed window was on, until Windows moves it off
-    // that layout once the helper unloaded it (measured: back within a second).
-    let settling = Instant::now();
-    wait_for(Duration::from_secs(2), "foreground thread layout changed", || layout_value(restore.foreground_thread) == restore.foreground_layout);
-    eprintln!("foreground thread back on {:#x} after {:?}", restore.foreground_layout, settling.elapsed());
+    // that layout once the helper unloaded it (measured: back within a second). When the user has
+    // the English (US) layout installed the helper does not unload it, and nothing moves that
+    // window off it (measured 2026-11-07: still on 0x4090409 after 2 s). The helper never sends a
+    // layout request to another app's window, so that is left as it is; the guard puts the window
+    // back when the test ends.
+    if restore.list.contains(&ENGLISH_US) {
+        eprintln!("English (US) is one of the user's layouts, so the window now in front stays on {:#x}", layout_value(restore.foreground_thread));
+    } else {
+        let settling = Instant::now();
+        wait_for(Duration::from_secs(2), "foreground thread layout changed", || layout_value(restore.foreground_thread) == restore.foreground_layout);
+        eprintln!("foreground thread back on {:#x} after {:?}", restore.foreground_layout, settling.elapsed());
+    }
     drop(helper);
     drop(fixture);
 }
@@ -274,6 +366,9 @@ fn layout_of(hwnd: HWND) -> u64 {
     unsafe { layout_value(GetWindowThreadProcessId(hwnd, None)) }
 }
 
+/// The English (US) layout the helper loads for typing (`LoadKeyboardLayoutW("00000409")`).
+const ENGLISH_US: u64 = 0x0409_0409;
+
 fn layout_value(thread: u32) -> u64 {
     unsafe { GetKeyboardLayout(thread).0 as usize as u64 }
 }
@@ -301,6 +396,32 @@ fn interactive_desktop() -> bool {
         let Ok(desktop) = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS) else { return false };
         let _ = CloseDesktop(desktop);
         true
+    }
+}
+
+/// Layouts loaded for a test, as if the user had them; dropped, unloads the ones that were not there.
+struct ExtraLayouts(Vec<HKL>);
+
+impl ExtraLayouts {
+    fn load(ids: &[&str]) -> Self {
+        let before = layout_list();
+        let mut added = Vec::new();
+        for id in ids {
+            let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+            let layout = unsafe { LoadKeyboardLayoutW(windows::core::PCWSTR(wide.as_ptr()), KLF_NOTELLSHELL) }.expect("load the layout");
+            if !before.contains(&(layout.0 as usize as u64)) {
+                added.push(layout);
+            }
+        }
+        Self(added)
+    }
+}
+
+impl Drop for ExtraLayouts {
+    fn drop(&mut self) {
+        for layout in &self.0 {
+            let _ = unsafe { UnloadKeyboardLayout(*layout) };
+        }
     }
 }
 

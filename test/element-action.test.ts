@@ -82,7 +82,7 @@ test("computer_element_action requires window_id, element_index and action, list
     assert.equal(schema.properties?.element_index?.type, "integer");
     assert.deepEqual(schema.properties?.action?.enum, ACTIONS);
     assert.equal(schema.properties?.tree_id?.type, "string");
-    assert.equal(listed.tools.length, 19);
+    assert.equal(listed.tools.length, 21);
   } finally {
     await harness.close();
   }

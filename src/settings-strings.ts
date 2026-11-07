@@ -158,7 +158,9 @@ export const SETTINGS_TEXT = {
       computer_list_windows: "列出視窗",
       computer_activate_window: "切換視窗",
       computer_read_clipboard: "讀剪貼簿",
+      computer_read_text: "讀元素文字",
       computer_wait: "等待",
+      computer_wait_for: "等待條件",
       computer_batch: "批次操作",
     } as Record<string, string>,
     /** A tool call with no tool name. */
@@ -177,6 +179,7 @@ export const SETTINGS_TEXT = {
       stopped_by_user: "你已停止",
       invalid_params: "參數不正確",
       window_not_found: "找不到視窗",
+      wait_timeout: "等待逾時",
       window_minimized: "視窗已最小化",
       foreground_changed: "前景視窗已改變",
       target_obscured: "目標被遮住",
@@ -203,6 +206,9 @@ export const SETTINGS_TEXT = {
       dialog: "詢問核准",
       elicitation: "在 MCP 用戶端詢問核准",
       other: "核准",
+      /** Reference-gaps G1: an approval about a key combination, asked in the dialog or answered from this session's memory. */
+      systemKeyAsked: "詢問是否允許組合鍵 {combination}",
+      systemKey: "組合鍵 {combination}",
       /** By the answer; an always-allow or a remembered allow by the channel it came through. */
       answers: {
         allow_once: "你允許一次",
@@ -458,7 +464,9 @@ export const SETTINGS_TEXT_EN: SettingsText = {
       computer_list_windows: "List windows",
       computer_activate_window: "Switch window",
       computer_read_clipboard: "Read clipboard",
+      computer_read_text: "Read element text",
       computer_wait: "Wait",
+      computer_wait_for: "Wait for a condition",
       computer_batch: "Batch of actions",
     },
     toolUnnamed: "Tool call",
@@ -476,6 +484,7 @@ export const SETTINGS_TEXT_EN: SettingsText = {
       stopped_by_user: "You stopped it",
       invalid_params: "Invalid parameters",
       window_not_found: "Window not found",
+      wait_timeout: "Wait timed out",
       window_minimized: "Window minimized",
       foreground_changed: "Foreground window changed",
       target_obscured: "Target obscured",
@@ -501,6 +510,8 @@ export const SETTINGS_TEXT_EN: SettingsText = {
       dialog: "Asked for approval",
       elicitation: "Asked for approval in the MCP client",
       other: "Approval",
+      systemKeyAsked: "Asked to allow the key combination {combination}",
+      systemKey: "Key combination {combination}",
       answers: {
         allow_once: "You allowed once",
         allow_always: "You always allowed",

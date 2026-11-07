@@ -80,7 +80,7 @@ test("a non-json helper line fails that request and the server still answers the
 });
 
 test("an incompatible helper version is reported for every tool call", async () => {
-  const harness = await connectServer({ script: { version: "10" } });
+  const harness = await connectServer({ script: { version: "18" } });
   try {
     const first = await harness.client.callTool({ name: "computer_list_windows", arguments: {} });
     const second = await harness.client.callTool({ name: "computer_list_windows", arguments: {} });
@@ -88,8 +88,8 @@ test("an incompatible helper version is reported for every tool call", async () 
       assert.equal(result.isError, true);
       const text = textContent(result);
       assert.equal(text.split(/\r?\n/)[0], "helper_version_mismatch");
-      assert.match(text, /"10"/);
-      assert.match(text, /"9"/);
+      assert.match(text, /"18"/);
+      assert.match(text, /"17"/);
     }
   } finally {
     await harness.close();
@@ -115,6 +115,22 @@ test("type_text waits 30 seconds, past the helper's 20-second typing limit, whil
   } finally {
     await withinBudget.close();
     await overBudget.close();
+  }
+});
+
+test("a click, element action or value set waits 15 seconds: a background one can take about 11.5 at worst", { timeout: 80_000 }, async () => {
+  for (const method of ["click", "element_action", "set_value"]) {
+    const withinBudget = await launchScriptedHelper({ handlers: { [method]: [{ delayMs: 12_000, result: { done: true } }] } });
+    const overBudget = await launchScriptedHelper({ handlers: { [method]: [{ delayMs: 16_000, result: { done: true } }] } });
+    try {
+      const [succeeded, timedOut] = await Promise.allSettled([withinBudget.helper.request(method, { window_id: "5" }), overBudget.helper.request(method, { window_id: "5" })]);
+      assert.equal(succeeded.status, "fulfilled", `${method}: ${succeeded.status === "rejected" ? String(succeeded.reason) : ""}`);
+      assert.equal(timedOut.status, "rejected", method);
+      assert.ok(timedOut.status === "rejected" && timedOut.reason instanceof ToolFailure && timedOut.reason.code === "helper_timeout", method);
+    } finally {
+      await withinBudget.close();
+      await overBudget.close();
+    }
   }
 });
 

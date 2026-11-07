@@ -1,5 +1,5 @@
 //! Open-source ticket 03: every text the helper shows the user, one table per language with the
-//! same keys: the approval dialog, the clipboard question, the "continue?" question after Esc, the
+//! same keys: the approval dialog, the clipboard and key combination questions, the "continue?" question after Esc, the
 //! settings page's confirm window, the border's label and the corner notice.
 //!
 //! The helper never detects the language: the server passes the one it decided (`--lang en` or
@@ -57,6 +57,8 @@ pub const APPROVE_BODY: &str = "approve.body";
 pub const APPROVE_ALWAYS_BODY: &str = "approve.always_body";
 pub const CLIPBOARD_TITLE: &str = "clipboard.title";
 pub const CLIPBOARD_BODY: &str = "clipboard.body";
+pub const SYSTEM_KEY_TITLE: &str = "system_key.title";
+pub const SYSTEM_KEY_BODY: &str = "system_key.body";
 pub const CONTINUE_TITLE: &str = "continue.title";
 /// The question itself, also the text of the client elicitation (`CONTINUE_MESSAGES` in src/server.ts).
 pub const CONTINUE_QUESTION: &str = "continue.question";
@@ -87,6 +89,11 @@ pub const EN: &[(&str, &str)] = &[
     (
         CLIPBOARD_BODY,
         "Allow the AI to read the text on your clipboard for this session?\r\n\r\nThe clipboard may hold passwords or other private content. Only text is read, never images or files. \"Allow once\" only lasts for this session. No answer within {seconds} seconds counts as a refusal.",
+    ),
+    (SYSTEM_KEY_TITLE, "Deskpass: Allow key combination"),
+    (
+        SYSTEM_KEY_BODY,
+        "Allow the AI to press {combination} in this app for this session?\r\n\r\n{name}\r\n{path}\r\n\r\nThis key combination can act beyond the app: it can close or switch windows, lock the computer or run system commands. \"Allow once\" only lasts for this session, for this combination in this app. No answer within {seconds} seconds counts as a refusal.",
     ),
     (CONTINUE_TITLE, "Deskpass: Continue?"),
     (CONTINUE_QUESTION, "You pressed Esc to stop Deskpass earlier. Let the AI continue?"),
@@ -121,6 +128,11 @@ pub const ZH_TW: &[(&str, &str)] = &[
     (
         CLIPBOARD_BODY,
         "要允許 AI 在本次工作階段讀取剪貼簿裡的文字嗎?\r\n\r\n剪貼簿可能有密碼或其他私人內容。只讀文字,不讀圖片與檔案。「本次允許」只在本次工作階段有效。{seconds} 秒內沒有回答視為拒絕。",
+    ),
+    (SYSTEM_KEY_TITLE, "Deskpass:允許組合鍵"),
+    (
+        SYSTEM_KEY_BODY,
+        "要允許 AI 在本次工作階段對這個 App 按下 {combination} 嗎?\r\n\r\n{name}\r\n{path}\r\n\r\n這個組合鍵的效果可能超出這個 App:它可以關閉或切換視窗、鎖定電腦或執行系統指令。「本次允許」只在本次工作階段、只對這個 App 的這個組合鍵有效。{seconds} 秒內沒有回答視為拒絕。",
     ),
     (CONTINUE_TITLE, "Deskpass:要繼續嗎?"),
     (CONTINUE_QUESTION, "你先前按了 Esc 停止操作,要讓 AI 繼續嗎?"),
@@ -253,6 +265,19 @@ mod tests {
         assert_eq!(Lang::parse("fr"), Lang::En);
         assert_eq!(Lang::parse(""), Lang::En);
         assert_eq!(Lang::parse("zh-tw"), Lang::En, "only the exact tags the server sends select Chinese");
+    }
+
+    /// Reference-gaps G1: in each language the question says which combination, in which app.
+    #[test]
+    fn the_system_key_question_names_the_combination_and_the_app() {
+        for lang in [Lang::En, Lang::ZhTw] {
+            let body = fill(text_in(lang, SYSTEM_KEY_BODY), &[("combination", "alt+f4"), ("name", "Demo"), ("path", "C:\\Apps\\demo.exe"), ("seconds", "60")]);
+            for shown in ["alt+f4", "Demo", "C:\\Apps\\demo.exe", "60"] {
+                assert!(body.contains(shown), "{lang:?} does not show {shown}: {body}");
+            }
+            assert!(!text_in(lang, SYSTEM_KEY_TITLE).is_empty());
+        }
+        assert!(has_cjk(text_in(Lang::ZhTw, SYSTEM_KEY_BODY)));
     }
 
     #[test]

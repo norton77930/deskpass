@@ -3,20 +3,28 @@ name: CI
 # Checks that need no interactive desktop: the TypeScript build, the npm tests other than the
 # end-to-end ones (they open real windows), the Rust unit tests, and that every Rust integration
 # test compiles. The desktop tests (helper/tests) run on a real desktop, not here.
+#
+# Actions are pinned by commit SHA (the tag in the comment); Dependabot (.github/dependabot.yml)
+# proposes updates. The Rust toolchain is rust-toolchain.toml's.
 
 on:
   push:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
@@ -28,10 +36,10 @@ jobs:
         run: npm run build:ts
 
       - name: Build the helper and its test binaries
-        run: cargo test --manifest-path helper/Cargo.toml --no-run
+        run: cargo test --locked --manifest-path helper/Cargo.toml --no-run
 
       - name: Rust unit tests
-        run: cargo test --manifest-path helper/Cargo.toml --bins
+        run: cargo test --locked --manifest-path helper/Cargo.toml --bins
 
       - name: npm tests
         env:

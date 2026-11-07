@@ -9,7 +9,9 @@ import { defaultLockDir } from "./lock.ts";
  * `%LOCALAPPDATA%\deskpass\logs\YYYY-MM-DD.jsonl`, read by the control panel later.
  * An event never holds what the user's apps show or what was sent to them: no typed or pasted
  * text, no keys, no clipboard, screenshot or UI-tree content, no window titles; only the app
- * (ticket 97: of a clipboard read, only its character count).
+ * (ticket 97: of a clipboard read, only its character count; reference-gaps G4: of an element's text
+ * read, the scope and the character count; reference-gaps G1: of a combination
+ * the user is asked about, its normalized name, which is the subject of the approval).
  * A new event type is one more member of `LogEvent` (ticket 90's `approval`, then the grant
  * events), written through the same `record`.
  */
@@ -19,6 +21,8 @@ export interface LoggedApp {
   path: string;
   key: string;
   tier: string | null;
+  /** `priorSignerKey`, when the app has one: where the settings page looks for a raise made under it. */
+  prior_key?: string;
 }
 
 export interface ToolCallEvent {
@@ -59,12 +63,15 @@ export type ApprovalAnswer = "allow_once" | "allow_always" | "refuse" | "timeout
 /**
  * Ticket 90: one approval decision for an app: asked or not, through which channel, and the answer.
  * Ticket 97: reading the clipboard is approved about no app: `app` is null and `subject` is
- * `clipboard` (an app's approval has no `subject`).
+ * `clipboard` (an app's approval has no `subject`). Reference-gaps G1: a dangerous key combination
+ * is approved in an app: `subject` is `system_key`, with the app and the `combination`.
  */
 export interface ApprovalEvent {
   event: "approval";
   app: LoggedApp | null;
-  subject?: "clipboard";
+  subject?: "clipboard" | "system_key";
+  /** With `subject: system_key`, the normalized combination (`normalizedCombination`). */
+  combination?: string;
   /** Null when no channel was involved: a blocked app is refused before any question. */
   channel: ApprovalChannel | null;
   answer: ApprovalAnswer;
@@ -124,6 +131,18 @@ export interface ClipboardReadEvent {
 }
 
 /**
+ * Reference-gaps G4: an element's text was read (`computer_read_text`): the app, which `scope`, how
+ * many characters (code points) were returned and whether there was more; never the text.
+ */
+export interface TextReadEvent {
+  event: "text_read";
+  app: LoggedApp;
+  scope: "selection" | "document";
+  chars: number;
+  more: boolean;
+}
+
+/**
  * Ticket 113: a change the user made on the settings page (session `settings`), named as the
  * native control panel named its own: an app raised to `tier` (`grant_removed`: its always-allow
  * went with it), a grant revoked, and (ticket 115) a raise removed. `path` is the app's executable
@@ -151,7 +170,7 @@ export interface TierRaiseRemovedEvent {
 
 export type SettingsChangeEvent = TierRaisedEvent | GrantRevokedEvent | TierRaiseRemovedEvent;
 
-export type LogEvent = ToolCallEvent | ApprovalEvent | GrantLogEvent | ClipboardReadEvent | SettingsChangeEvent;
+export type LogEvent = ToolCallEvent | ApprovalEvent | GrantLogEvent | ClipboardReadEvent | TextReadEvent | SettingsChangeEvent;
 
 /** What every line has before the event's own fields. */
 interface Stamped {

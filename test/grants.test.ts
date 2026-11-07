@@ -80,7 +80,7 @@ async function writeGrants(harness: Harness, content: unknown, { key = true }: {
 }
 
 const identities = (count: number, signer = SIGNER, fileName = "demo.exe") =>
-  Array.from({ length: count }, () => ({ result: { signed: true, signer, file_name: fileName } }));
+  Array.from({ length: count }, () => ({ result: { signed: true, signer, file_name: fileName, original_name: fileName } }));
 const windows = (count: number, window: Record<string, unknown> = demo) => Array.from({ length: count }, () => ({ result: window }));
 
 /** Ticket 95: a signed normal app is asked through the helper's dialog; these answer Allow once. */

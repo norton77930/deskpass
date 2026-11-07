@@ -3,7 +3,9 @@ import { createHmac } from "node:crypto";
 import { copyFile, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import path, { join } from "node:path";
 import { test } from "node:test";
+import { GrantStore, type GrantMac } from "../src/grants.ts";
 import { defaultLockDir } from "../src/lock.ts";
+import { appRows, noStartMenu, recentLogUses } from "../src/settings-apps.ts";
 import { approvalAnswers, connectServer, repoRoot, textContent, type FakeHandler, type Harness } from "./harness.ts";
 
 // Ticket 96: a signed grants.json, revoking a grant or raising a tier, is taken by the running
@@ -40,7 +42,7 @@ const windowOf = (app: string, name: string, id: string, pid: number) => ({
 });
 const demo = windowOf(DEMO, "Demo", "5", 4242);
 
-const signedAs = (fileName: string): FakeHandler => ({ result: { signed: true, signer: SIGNER, file_name: fileName } });
+const signedAs = (fileName: string): FakeHandler => ({ result: { signed: true, signer: SIGNER, file_name: fileName, original_name: fileName } });
 const repeat = <T>(count: number, value: T): T[] => Array.from({ length: count }, () => value);
 
 let stamp = Date.parse("2026-05-01T00:00:00Z");
@@ -86,6 +88,39 @@ test("the fixtures are signed with the fake helper's key: each entry and the fil
   // Raising Notes removed its always-allow grant.
   assert.deepEqual(raised.grants.map((entry: { key: string }) => entry.key), []);
   assert.deepEqual(raised.raised.map(({ key, tier }: { key: string; tier: string }) => ({ key, tier })), [{ key: NOTES_KEY, tier: "blocked" }]);
+});
+
+test("a raise made under a signer's key still applies to a signed app whose version resource names another file", async () => {
+  const notes = windowOf(NOTES, "Notes", "6", 4343);
+  const harness = await connectServer({
+    elicitation: "form",
+    script: {
+      handlers: {
+        get_window: repeat(2, { result: notes }),
+        app_identity: repeat(2, { result: { signed: true, signer: SIGNER, file_name: "notes.exe", original_name: "notes.dll" } }),
+        ask_user: [{ result: { answer: "allow" } }],
+      },
+    },
+  });
+  try {
+    await putFixture(harness, "raised.json");
+    const result = await typeText(harness, "6");
+    assert.equal(code(result), "blocked_app", textContent(result));
+    assert.equal((await methods(harness)).includes("ask_user"), false, "a blocked app is refused without asking");
+
+    // The settings page shows that app once, under the key the raise is under, so what it shows is
+    // what the tool does, and its controls act on the raise that is in force.
+    const hmac = (fields: Record<string, unknown>) =>
+      createHmac("sha256", Buffer.from(FAKE_GRANT_KEY, "hex"))
+        .update(JSON.stringify(Object.fromEntries(Object.entries(fields).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))), "utf8")
+        .digest("hex");
+    const mac: GrantMac = async ({ entries }) => ({ macs: entries.map((entry) => hmac(entry.fields)), key_state: "ok" });
+    const view = await new GrantStore({ dir: harness.dir, record: async () => undefined }).current(mac);
+    const rows = await appRows(view, await recentLogUses(join(harness.dir, "logs")), noStartMenu());
+    assert.deepEqual(rows.map((row) => [row.key, row.tier, row.source, row.raised, row.path]), [[NOTES_KEY, "blocked", "user", "blocked", NOTES]]);
+  } finally {
+    await harness.close();
+  }
 });
 
 test("a revoke written to the file takes effect at the running server's next check: the app is asked again", async () => {
